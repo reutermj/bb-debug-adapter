@@ -167,12 +167,17 @@ message RelayToEdge {
   }
 }
 
-// First message on every Attach stream. Declares the session and role and the
-// edge's resume intent + inbound high-water.
+// First message on every Attach stream. Declares the session and role, and
+// whether this is a fresh attach or a reconnect. Materialization (lazy
+// first-touch) happens ONLY on the Open path — a Resume never creates a session.
 message Hello {
-  string  session_key = 1;
-  Side    side        = 2;
-  Resume  resume      = 3;
+  string session_key = 1;
+  Side   side        = 2;
+
+  oneof attach {
+    Open   open   = 3;  // fresh attach; materialize (first-touch) if absent
+    Resume resume = 4;  // reconnect to an EXISTING session; never creates
+  }
 }
 
 enum Side {
@@ -181,24 +186,21 @@ enum Side {
   SERVER = 2;  // worker-side forwarder; produces server->client
 }
 
+// Fresh attach. The edge does not assume a pre-existing session: if absent, the
+// relay materializes it (lazy first-touch, §5.4); if present, the edge attaches.
+// Carries no high-water — a fresh attach has consumed nothing.
+message Open {}
+
+// Reconnect to a session the edge believes is still live. The relay attaches to
+// the EXISTING session and resumes inbound delivery from
+// inbound_delivered_through + 1. It NEVER materializes: if the relay has no such
+// session (reaped, or never existed), it fails the stream with NOT_FOUND (the
+// "tombstone"), so the edge learns its session is gone instead of silently
+// landing in a fresh empty one (§5.4). Re-materialization is reserved for Open.
 message Resume {
-  Intent intent = 1;
-
   // Highest INBOUND seq this edge has durably handled (written to local TCP).
-  // 0 on a fresh connection. The relay resumes inbound delivery from here + 1.
-  uint64 inbound_delivered_through = 2;
-
-  enum Intent {
-    // Attach to the session, materializing it (lazy first-touch) if absent.
-    // Used by an edge that does not assume a pre-existing session.
-    OPEN_OR_CREATE = 0;
-
-    // Attach to an EXISTING session. If the relay has no such session
-    // (reaped, or never existed), it fails the stream with NOT_FOUND
-    // (the "tombstone"), so a reconnecting edge learns its session is gone
-    // instead of silently landing in a fresh empty one (§5.4).
-    RESUME = 1;
-  }
+  // The relay resumes inbound delivery from here + 1.
+  uint64 inbound_delivered_through = 1;
 }
 
 // One entry in a direction's log. Frames flow up (outbound) on EdgeToRelay and
@@ -244,23 +246,26 @@ message Ack {
 
 ### 6.1 Handshake
 
-1. Edge opens `Attach` and sends `Hello{session_key, side, resume}`.
-2. Relay resolves the session per `resume.intent`:
-   - `OPEN_OR_CREATE`, session absent → **materialize** it (first-touch).
-   - `OPEN_OR_CREATE`/`RESUME`, session present → attach. If another stream is
-     already attached for the same `{session_key, side}`, the **new stream takes
-     over** and the old one is closed with `ABORTED` ("superseded").
-   - `RESUME`, session absent → fail the stream with **`NOT_FOUND`** (tombstone).
+1. Edge opens `Attach` and sends `Hello{session_key, side, open|resume}`.
+2. Relay resolves the session per the `attach` variant:
+   - `Open`, session absent → **materialize** it (first-touch). This is the
+     **only** path that creates a session.
+   - `Open` or `Resume`, session present → attach. If another stream is already
+     attached for the same `{session_key, side}`, the **new stream takes over**
+     and the old one is closed with `ABORTED` ("superseded").
+   - `Resume`, session absent → fail the stream with **`NOT_FOUND`** (tombstone).
+     A `Resume` **never** materializes.
 3. Relay immediately sends `Ack{through = outbound high-water}` — i.e. the
    highest seq it has already buffered for this edge's outbound direction. This
    tells the producer its **resume point**: drop retained outbound ≤ `through`,
    then (re)send from `through + 1`.
 4. Relay (re)starts delivering inbound frames from
-   `resume.inbound_delivered_through + 1`.
+   `inbound_delivered_through + 1` (which is `0 + 1 = 1` for an `Open`).
 
 Both resume points are thus exchanged at the handshake: the edge tells the relay
-where to resume *inbound delivery* (via `Hello`), and the relay tells the edge
-where to resume *outbound production* (via the first `Ack`).
+where to resume *inbound delivery* (via `Resume.inbound_delivered_through`; an
+`Open` implies 0), and the relay tells the edge where to resume *outbound
+production* (via the first `Ack`).
 
 ### 6.2 Steady state
 
@@ -280,9 +285,12 @@ where to resume *outbound production* (via the first `Ack`).
 
 A stream that ends **without** an in-band `Close` and **without** a terminal
 status (§7) is a transient drop. The edge keeps its local TCP open, reconnects,
-and sends `Hello{RESUME, inbound_delivered_through = <last written>}`. The
-handshake (6.1) re-establishes both resume points; retained frames are replayed;
-dedupe absorbs any overlap. Neither DAP endpoint observes more than a pause.
+and sends `Hello{Resume{inbound_delivered_through = <last written>}}` — a
+reconnect always uses `Resume`, never `Open`, so a session the relay has already
+reaped surfaces as a `NOT_FOUND` tombstone rather than silently re-materializing.
+The handshake (6.1) re-establishes both resume points; retained frames are
+replayed; dedupe absorbs any overlap. Neither DAP endpoint observes more than a
+pause.
 
 ## 7. Termination
 
@@ -317,24 +325,27 @@ drain). The edge treats these as terminal: close local TCP, do **not** reconnect
 
 | Condition | Status | Meaning |
 |---|---|---|
-| `RESUME` on absent/reaped session | `NOT_FOUND` | Tombstone — your session is gone (§5.4). |
+| `Resume` on absent/reaped session | `NOT_FOUND` | Tombstone — your session is gone (§5.4). `Resume` never creates. |
 | Byte cap exceeded | `RESOURCE_EXHAUSTED` | Unacked buffer over the hard cap; session aborted (§5.4). Cannot drop unacked frames without corrupting DAP, so the cap aborts. |
 | Idle / orphan reap while connected | `ABORTED` | Reaped by a lifecycle timeout (§8). |
 | Superseded by a newer stream | `ABORTED` | Another stream attached for the same `{session_key, side}`. |
 
 By contrast, a bare transport failure / `UNAVAILABLE` / `DEADLINE_EXCEEDED` is
-**transient** → reconnect and `RESUME` (§6.3).
+**transient** → reconnect with `Resume` (§6.3).
 
-### 7.3 Reaped-session reconnect (tombstone vs. re-materialize)
+### 7.3 Reaped-session reconnect (tombstone, never re-materialize)
 
-This is the §5.4 decision encoded directly in `Resume.intent`:
+This is the §5.4 decision encoded structurally in the `Hello.attach` oneof —
+**materialization is exclusive to `Open`; `Resume` can never create**:
 
-- A reconnecting edge that expects its session to still be live sends `RESUME`;
-  if the relay reaped it, the edge gets `NOT_FOUND` and learns the session is
-  gone (rather than silently re-creating an empty one).
-- A genuinely new debug job sends `OPEN_OR_CREATE`; if the session is absent it
-  is lazily materialized — it may legitimately be a brand-new session that
-  happens to present a key the relay no longer knows.
+- A reconnecting edge always sends `Resume` (it believes its session is live). If
+  the relay has reaped it, the edge gets `NOT_FOUND` and learns the session is
+  gone, rather than silently landing in a fresh empty session that would wait
+  forever for a peer that is never coming back.
+- Materialization happens only on a fresh `Open`. A brand-new debug job uses a
+  fresh UUID and `Open`, so it materializes cleanly; it does not collide with a
+  reaped key. (The relay keeps no tombstone records — "absent" simply means "no
+  live session," and only `Open` may create one.)
 
 ## 8. Timeouts and resource bounds
 

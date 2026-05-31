@@ -508,18 +508,19 @@ data flow.
   (process exit), the edges simply close; the DAP client sees a plain socket
   close. If the remote adapter sent its own `terminated`/`exited` before exiting,
   those flow through as ordinary payloads — but nothing is invented on its behalf.
-- **Reconnect into a reaped session — intent-dependent.** It hinges on what the
-  reconnecting edge declares:
-  - *Resuming a live session* (it announces a resume / a non-zero high-water mark
-    for a `session_key` the relay has reaped): return a clear **tombstone** error
-    so the edge knows its session is gone rather than silently landing in a fresh
-    empty one.
-  - *Starting a new session* (a fresh connect with no resume state): **lazily
-    re-materialize** under first-touch — it may legitimately be a brand-new debug
-    job that happens to present a key the relay no longer knows.
+- **Reconnect into a reaped session — tombstone; never re-materialize on
+  resume.** Materialization is **exclusive to a fresh open**; a *resume* must
+  never create a session. The reconnecting edge declares which it is doing:
+  - *Resume* (a reconnect — the edge believes its session is still live): if the
+    relay has reaped it, return a clear **tombstone** error so the edge learns its
+    session is gone, rather than silently landing in a fresh empty session that
+    would wait forever for a peer that is never coming back.
+  - *Open* (a fresh attach): lazily materialize under first-touch if absent. A
+    brand-new debug job uses a fresh UUID and an open, so it never collides with a
+    reaped key.
 
-  This makes the `Hello` message's resume-vs-new intent (§7.3) load-bearing: the
-  relay distinguishes the two cases by what the edge declares on connect.
+  This makes the open-vs-resume distinction in `Hello` (§7.3) load-bearing, and
+  is enforced structurally: only the open path can create a session.
 - **Detach-while-paused worker-slot hazard — terminate on a configurable
   timeout.** Rather than make the proxy DAP-aware, the worker side terminates the
   action process after a **configurable timeout** once the debug session has ended
