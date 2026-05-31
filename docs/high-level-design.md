@@ -215,7 +215,7 @@ would change how the key is produced and delivered, but not the relay protocol
 or the overall data flow. We start with the env var for simplicity and revisit
 if a less manual / more automatic identity scheme is warranted.
 
-### 5.2 How the developer's traffic reaches the relay — **Leaning: frontend-hosted gRPC service**
+### 5.2 How the developer's traffic reaches the relay — **Decided: frontend-fronted gRPC service backed by a separate `bb_dap_relay`**
 
 Preferred direction: the relay is a **new gRPC service hosted on the existing
 `bb_storage` frontend**, so the developer's proxy connects only to the frontend
@@ -243,10 +243,20 @@ composition pattern). We expect and accept this upstream change; the benefit is
 that once registered, the relay transparently inherits the frontend's listen
 address, TLS, and auth interceptors — no new endpoint, port, or transport stack.
 
-Still open: whether the relay's per-session buffer lives **in** the frontend
-process or in a **separate backend** that the frontend fronts (analogous to how
-the frontend fronts the scheduler for Execution), and how that interacts with a
-horizontally-scaled, multi-replica frontend (session affinity / shared state).
+**Buffer location — Decided: a separate `bb_dap_relay` service.** The per-session
+buffer lives in its own backend service, **not** in the frontend process. The
+`bb_storage` frontend's only role is to be the single gRPC endpoint that demuxes
+the `DebugAdapterRelay` methods (by method name) and **forwards** them to
+`bb_dap_relay` — exactly analogous to how the frontend fronts the scheduler for
+Execution. This keeps the buffer's memory and lifecycle out of the
+latency-sensitive storage frontend.
+
+**Multi-replica — Decided (MVP): a single `bb_dap_relay` node.** There is exactly
+**one** `bb_dap_relay` instance that all frontend shards forward to, so all state
+for a session naturally lives in one place. We do **not** solve horizontal
+scaling (session affinity / shared state across multiple relay replicas) for the
+MVP; a single node sidesteps it entirely. Scaling out is a later, backward-
+compatible concern.
 
 ### 5.3 Concurrency with the blocking `Run` call — **Partially narrowed**
 The forwarder must run while `Runner.Run` is in flight.
@@ -478,31 +488,46 @@ dimension, or unifying it with the teardown reconnect-grace window are all
 backward-compatible refinements that change a number/policy, not the protocol or
 data flow.
 
-Still open:
-- **Teardown timeout values.** Concrete durations for the reconnect grace,
-  orphan, and idle timeouts above.
-- **Peer-facing end semantics.** Whether the proxy surfaces a clean DAP
-  `terminated`/`exited` (synthesizing one if the remote adapter didn't send it)
-  or lets the client see a raw socket close. A *proxy-UX* decision, since the
-  relay stays DAP-agnostic.
-- **Reconnect into a reaped session.** Whether a reconnect with a reaped
-  `session_key` gets a clear "session gone" error (brief tombstone) or is allowed
-  to harmlessly re-materialize an empty session under lazy first-touch.
-- **Detach-while-paused worker-slot hazard.** If a developer closes the client
-  while the debuggee is paused at a breakpoint, many adapters leave the process
-  suspended, hanging the action (and its worker slot) until the action timeout.
-  Mitigation (e.g. the proxy injecting a DAP `disconnect` on client loss) is
-  DAP-aware proxy behavior and is deferred, but noted for its farm-cost impact.
+**Remaining lifecycle details — Decided.**
+- **Teardown timeout values — configurable.** The reconnect-grace, orphan, and
+  idle timeouts are exposed in the normal Buildbarn configuration files (jsonnet),
+  not hard-coded. Sensible defaults ship; operators tune them.
+- **Peer-facing end semantics — do not synthesize.** The relay and proxy do
+  **not** fabricate any DAP `terminated`/`exited`. On the remote side going away
+  (process exit), the edges simply close; the DAP client sees a plain socket
+  close. If the remote adapter sent its own `terminated`/`exited` before exiting,
+  those flow through as ordinary payloads — but nothing is invented on its behalf.
+- **Reconnect into a reaped session — intent-dependent.** It hinges on what the
+  reconnecting edge declares:
+  - *Resuming a live session* (it announces a resume / a non-zero high-water mark
+    for a `session_key` the relay has reaped): return a clear **tombstone** error
+    so the edge knows its session is gone rather than silently landing in a fresh
+    empty one.
+  - *Starting a new session* (a fresh connect with no resume state): **lazily
+    re-materialize** under first-touch — it may legitimately be a brand-new debug
+    job that happens to present a key the relay no longer knows.
 
-### 5.5 Triggering debug mode — **Partially decided**
+  This makes the `Hello` message's resume-vs-new intent (§7.3) load-bearing: the
+  relay distinguishes the two cases by what the edge declares on connect.
+- **Detach-while-paused worker-slot hazard — terminate on a configurable
+  timeout.** Rather than make the proxy DAP-aware, the worker side terminates the
+  action process after a **configurable timeout** once the debug session has ended
+  / the client is gone, so a debuggee left suspended at a breakpoint cannot pin a
+  worker slot indefinitely. The timeout lives in the worker configuration.
+
+### 5.5 Triggering debug mode — **Decided**
 An action opts into debugging by carrying the `BB_DEBUG_SESSION_ID` environment
 variable (§5.1); the worker only spins up a forwarder when that variable is
-present. Still open: whether a **constant** platform property (e.g.
-`debug=true`) should additionally be used to route debuggable actions to a
-dedicated, debug-enabled worker pool. Unlike a per-session value, a constant
-property is a legitimate use of the platform key (§5.1) and is the right tool
-*if* only some workers should accept inbound debug forwarding. This is a
-deployment choice we can defer.
+present.
+
+**Routing debuggable actions to specific workers is out of scope for this
+service.** A user who wants only some workers to accept debug forwarding can
+already express that with the **existing instance-name / platform-property
+mechanism** (e.g. a constant `debug=true` platform property routing to a
+dedicated pool, or a dedicated instance name). That is a legitimate, normal use
+of the platform key (§5.1) and entirely the deployer's concern — we deliberately
+do **not** build any routing or pool-selection logic into the relay, forwarder,
+or proxy.
 
 ### 5.6 Security / authorization — **Deferred (out of scope for MVP)**
 Attaching a debugger to a remote process is privileged. Who is allowed to attach
