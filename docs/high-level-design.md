@@ -418,13 +418,71 @@ rendezvous handshake"). We knowingly accept that, with auth deferred (§5.6), an
 connection bearing any UUID allocates state — abuse mitigation is out of scope
 for the MVP and the unguessable key is the only gate.
 
+**Session teardown — Decided: explicit terminal-close marker + drain-then-drop,
+with timeouts as safety nets.** Reclaiming a session must not break the
+disconnect-tolerance guarantee above, so the design rests on one distinction and
+one rule.
+
+*The distinction — a dropped gRPC stream is not a teardown.* A stream drop is
+ambiguous (did the edge crash, or is it mid-reconnect?), so it can never by
+itself end a session. The relay distinguishes:
+- **Transient relay-hop disconnect** — the edge's *local* TCP (to the DAP client
+  or DAP server) is still alive and it will reconnect → **retain and await
+  replay**.
+- **Terminal end** — the edge's *local* TCP has closed (the DAP client quit, or
+  the action/DAP server exited) → the DAP session is genuinely over → **reap**.
+
+To make this observable rather than guessed, an edge sends an **explicit
+terminal-close marker** when its local socket closes — distinct from merely
+letting the gRPC stream drop. The protocol (§7.3) must carry this marker.
+
+*The rule — teardown is drain-then-drop, not an immediate purge.* The terminal
+marker is placed in the log **after the last message** in that direction; the
+relay keeps delivering and getting acks for the messages still buffered for the
+peer, then reaps. This protects the most important final messages — the DAP
+`terminated`/`exited` events — and is consistent with the §5.4 principle that
+evicting an unacked message corrupts the session. Action-exit ends both
+directions asymmetrically: new client→server messages are refused/discarded
+(the DAP server is gone), while buffered server→client messages must still drain
+to the proxy.
+
+*Authority and propagation.*
+- **Action exit is the authoritative terminal signal.** When `Runner.Run`
+  returns, the worker tears down the forwarder (§5.3); the forwarder is the right
+  emitter of the server-side terminal marker (optionally with a reason:
+  exited / killed / timed out). The thing being debugged is gone, so the session
+  has no reason to live.
+- **Client-gone is terminal for the proxy side but does not imply action-gone.**
+  The action runs to completion regardless of whether a debugger is attached, so
+  a client detach reaps the *session state* but does not stop execution.
+- On reap, the relay closes the surviving peer's stream with a status so its edge
+  stops reconnecting and propagates the end downward; teardown is **idempotent**
+  (both edges may signal end concurrently).
+
+*Timeouts (safety nets only — named here, values still open):*
+- **Reconnect grace window** — how long to retain a session after a stream drops
+  with *no* terminal marker, before giving up on replay.
+- **Orphan timeout** — materialized, but the second edge never connects.
+- **Idle timeout** — both edges gone / no activity.
+
 Still open:
 - **Backpressure-vs-abort threshold.** The concrete cap (bytes/messages/age) at
   which the safety valve fires, and whether the relay blocks (pure backpressure)
   right up to that cap.
-- **Session teardown / GC.** Materialization is settled (above); teardown is not.
-  When is a session garbage-collected — on action exit, on explicit DAP
-  `disconnect`, on an idle timeout after both sides leave?
+- **Teardown timeout values.** Concrete durations for the reconnect grace,
+  orphan, and idle timeouts above.
+- **Peer-facing end semantics.** Whether the proxy surfaces a clean DAP
+  `terminated`/`exited` (synthesizing one if the remote adapter didn't send it)
+  or lets the client see a raw socket close. A *proxy-UX* decision, since the
+  relay stays DAP-agnostic.
+- **Reconnect into a reaped session.** Whether a reconnect with a reaped
+  `session_key` gets a clear "session gone" error (brief tombstone) or is allowed
+  to harmlessly re-materialize an empty session under lazy first-touch.
+- **Detach-while-paused worker-slot hazard.** If a developer closes the client
+  while the debuggee is paused at a breakpoint, many adapters leave the process
+  suspended, hanging the action (and its worker slot) until the action timeout.
+  Mitigation (e.g. the proxy injecting a DAP `disconnect` on client loss) is
+  DAP-aware proxy behavior and is deferred, but noted for its farm-cost impact.
 - **What happens to an in-flight session when the action exits or times out**
   (the DAP server goes away) — surface a clean DAP `terminated`/`exited` to the
   client, or just close?
