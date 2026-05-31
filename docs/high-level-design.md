@@ -612,6 +612,6 @@ add it.
    [`forwarder.md`](forwarder.md) (§7.4): `side = FORWARDER`, reads
    `BB_DEBUG_SESSION_ID` from the `Command`, injects `BB_DEBUG_PORT`, retry-dials
    the action, terminates the action on debug-session-end.
-6. Specify the local proxy and how a developer configures/launches it (the CLI
-   takes the session key and the frontend endpoint). Builds on the edge-client as
-   `side = PROXY`.
+6. ~~Specify the local proxy~~ — drafted in [`proxy.md`](proxy.md) (§7.5):
+   `side = PROXY`, CLI (`--session-id`, `--frontend`, `--listen`), local DAP
+   listener via the frontend, terminate-on-detach, attach-timeout UX.
