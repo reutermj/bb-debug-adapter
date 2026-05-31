@@ -362,11 +362,22 @@ custom sequencing. *Caveat:* DAP clients impose a timeout on the
 may time out. This is a client-config / proxy-UX concern (attach timeout,
 "connecting…" affordance), not a relay design issue.
 
-Implied protocol shape: **one bidirectional streaming RPC** that both edges
-call; the first message declares `{session_key, side}`; subsequent messages are
-`{seq, payload}` (one whole DAP message) plus acknowledgements; the relay keeps a
-per-direction sequence-numbered log, forwards to the connected peer, and replays
-unacked messages on reconnect.
+Implied protocol shape: a **bidirectional streaming RPC** carries each edge's
+connection; the first message declares `{session_key, side}`; subsequent messages
+are `{seq, payload}` (one whole DAP message) plus acknowledgements; the relay
+keeps a per-direction sequence-numbered log, forwards to the connected peer, and
+replays unacked messages on reconnect.
+
+*Not a hard requirement:* whether both edges call **one** RPC (distinguishing
+their role via the `side` field) or whether the client and worker get **separate
+per-role RPCs** is a deliberately-open, reversible API-surface choice — it
+changes a method name and an enum field, not the protocol or data flow. What
+*is* load-bearing is that both roles share the **same stream message grammar**
+(so a single relay-client library serves both the proxy and the forwarder). For
+the MVP we default to **one shared RPC with a `side` field** because the two
+roles are symmetric today; we revisit only if they diverge (e.g. per-role auth
+under §5.6, or role-specific metadata). We equally do **not** mandate multiple
+RPCs.
 
 **Message GC / buffer bounds — Decided.** The per-session buffer is
 flexibly sized and retains only the **in-flight (sent-but-unacked) window** per
