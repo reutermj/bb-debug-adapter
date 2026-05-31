@@ -29,7 +29,7 @@ placeholder):
   `session_key`; the developer is responsible for using the same value on both
   sides.
 - **`--frontend=<endpoint>`** (+ TLS/credentials) — the `bb_storage` frontend gRPC
-  endpoint to reach the relay through (§3).
+  endpoint to reach the relay through (§5.2).
 - **`--listen=127.0.0.1:<port>`** — where the local DAP client connects. Defaults
   to loopback (§9).
 
@@ -62,7 +62,8 @@ directly), the proxy **always** goes via the frontend.
 
 **One session per invocation (MVP).** The proxy handles a single DAP client
 connection for its `session_key`, then exits when that session ends. This is a
-natural consequence of terminate-on-detach (§5.4 #2): once the DAP client
+natural consequence of terminate-on-detach (§5.4 "Terminate the action on
+debug-session-end"): once the DAP client
 disconnects, the action is terminated, so there is nothing to re-attach to.
 Debugging again means a fresh build with a fresh UUID. (Re-accepting sequential
 connections is a possible later refinement, §10.)
@@ -81,7 +82,7 @@ Driven by the edge-client's terminal outcome (edge-client §9.4):
 - **`LocalClosed`** (the developer stopped debugging — the DAP client disconnected
   first): the edge-client emits the terminal `Close{LOCAL_PEER_DISCONNECTED}`,
   which reaches the forwarder and causes the worker to terminate the action
-  (§5.4 #2). The proxy reports and exits.
+  (§5.4 "Terminate the action on debug-session-end"). The proxy reports and exits.
 - **`Tombstone`** (`NOT_FOUND`): a reconnect found the session reaped (e.g. the
   action exited and was reaped during a relay-stream gap). The edge-client closes
   the local DAP socket; the proxy reports "session is gone" and exits. (The first
@@ -106,7 +107,8 @@ response, consistent with the no-synthesize decision, §5.4):
 
 ## 7. Relay/frontend failures
 
-Symmetric to the forwarder's open coupling question (#1), but developer-facing. If
+Symmetric to the forwarder's open coupling question (forwarder §8), but
+developer-facing. If
 the frontend/relay is unreachable, the edge-client keeps retrying (reconnect
 backoff, edge-client §8) while the local DAP socket is open; the DAP client sees
 only a pause. Because failures here are seen by a human, the proxy should emit

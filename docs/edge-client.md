@@ -146,9 +146,14 @@ edge-client:
    outbound entry** (reason/exit_code supplied by the edge layer —
    `LOCAL_PEER_DISCONNECTED` for the proxy, `PROCESS_EXITED` + code for the
    forwarder).
-2. Ensures that `Close` is **receipt-acked** by the relay (so the relay holds it
-   to drain to the peer, protocol §7.1), retransmitting across a reconnect if the
-   stream drops before the ack.
+2. Tries, **best-effort**, to get that `Close` **receipt-acked** by the relay (so
+   the relay holds it to drain to the peer, protocol §7.1), including across a
+   reconnect if the stream drops before the ack. This flush is **bounded by the
+   edge layer**, not unbounded: the edge layer decides how long to keep trying
+   before giving up (the proxy exits promptly; the forwarder's bound is part of
+   the open coupling question, forwarder §8). If the flush is abandoned, the peer
+   simply falls back to timeout-based teardown (protocol §8) instead of a clean
+   `Close` — correctness holds, only the "clean end" UX degrades.
 3. Then finishes. It does **not** keep delivering inbound — its local socket is
    gone, so inbound has nowhere to land; the relay drains this edge's `Close` to
    the peer and reaps.

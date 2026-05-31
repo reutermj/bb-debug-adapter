@@ -93,7 +93,8 @@ emitted already having flowed through beforehand (§5.4).
 
 The proxy's terminal `Close` reaches the forwarder as an inbound `Close`, so the
 edge-client returns **`PeerClosed`** (edge-client §9.2). On that outcome the
-worker **terminates the action immediately** (§5.4, decision #2) — using the
+worker **terminates the action immediately** (§5.4, "Terminate the action on
+debug-session-end") — using the
 cancellation machinery it already has for action timeouts. `Runner.Run` then
 returns and teardown proceeds as in §5.1 (now with a killed exit status). No
 grace period, no timer; attach-style "detach and keep running" is a non-goal.
@@ -105,7 +106,7 @@ server, early crash, wrong port), the forwarder gives up dialing. Any proxy
 waiting on the relay never gets a peer and is eventually reaped by the relay's
 orphan timeout (protocol §8). The action's own result is unaffected.
 
-## 6. Reaching the relay (#3)
+## 6. Reaching the relay
 
 The forwarder dials **`bb_dap_relay` directly**, not through the `bb_storage`
 frontend (§5.2 permits this for internal farm components). The worker holds one
@@ -113,7 +114,7 @@ relay gRPC client (configured per §7), and each forwarder opens an `Attach` str
 on it via the edge-client. This reuses the worker's existing pattern of holding
 outbound gRPC clients to the farm.
 
-## 7. Configuration (#4)
+## 7. Configuration
 
 New worker configuration:
 
@@ -128,7 +129,7 @@ New worker configuration:
 the same host, and does not intersect the OS ephemeral range (Linux
 ~`32768–60999`); fail or warn loudly otherwise.
 
-## 8. Interaction with normal execution — best-effort coupling left open (#1)
+## 8. Interaction with normal execution — best-effort coupling left open
 
 The forwarder is a goroutine beside `Runner.Run`; the action executes
 independently of it. If the relay is unreachable, the edge-client keeps retrying
@@ -136,7 +137,8 @@ independently of it. If the relay is unreachable, the edge-client keeps retrying
 open, and the action is **not** blocked on it.
 
 Whether a debug-relay failure should ever surface as an **action failure** is
-**deliberately left open** (#1): a debug session exists to debug, so a broken
+**deliberately left open**: a debug session exists to
+debug, so a broken
 relay is arguably a broken run — but we are not committing to strong isolation
 *or* strong coupling for the MVP. Concretely the MVP does the simple, natural
 thing — forwarder problems are logged and do not fail the action, and on action
@@ -144,7 +146,7 @@ exit the worker does not block the result indefinitely on flushing the terminal
 `Close` (§5.1) — and we leave the coupling policy to revisit later rather than
 engineering guarantees around it now.
 
-## 9. Code changes and hook points (#5)
+## 9. Code changes and hook points
 
 - **Read `BB_DEBUG_SESSION_ID`** from `Command.environment_variables` in the
   per-thread executor to decide debuggability (§2).
@@ -161,7 +163,7 @@ framing, the terminal `Close`) is the **edge-client's**, not duplicated here.
 
 ## 10. Open questions
 
-- **Best-effort coupling (#1, open)** — see §8; the action-vs-debug-failure
+- **Best-effort coupling (open)** — see §8; the action-vs-debug-failure
   coupling policy is intentionally unresolved.
 - **Forwarder close reason when the DAP socket dies but the action lives** — if
   the action's DAP server closes/garbles while the process keeps running, what
@@ -169,5 +171,5 @@ framing, the terminal `Close`) is the **edge-client's**, not duplicated here.
   with a best-effort reason; refine alongside the edge-client's
   malformed-frame policy (edge-client §13).
 - **Flush bound on action exit** — how long, if at all, to let the terminal
-  `Close` flush before returning the action result (§5.1); part of the #1 coupling
-  question.
+  `Close` flush before returning the action result (§5.1); part of the best-effort
+  coupling question (§8).
