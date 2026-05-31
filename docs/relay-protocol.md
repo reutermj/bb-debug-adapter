@@ -422,9 +422,10 @@ timeouts so a dead stream is noticed well before a session would be reaped. (Set
 the relay's server-side keepalive enforcement policy to permit the edges' client
 keepalives.)
 
-The **detach-while-paused worker-slot hazard** (§5.4) is handled by the *worker*
-terminating the action on a configurable timeout once the session ends; it is
-not part of this protocol.
+When the debug session ends (the forwarder sees the proxy's terminal `Close`),
+the *worker* terminates the action immediately (§5.4) — this also covers the
+detach-while-paused worker-slot hazard. It is worker behavior, not part of this
+protocol.
 
 ## 9. Deliberately out of scope (MVP)
 

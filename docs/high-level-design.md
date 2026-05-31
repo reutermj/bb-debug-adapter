@@ -482,9 +482,13 @@ to the proxy.
   emitter of the server-side terminal marker (optionally with a reason:
   exited / killed / timed out). The thing being debugged is gone, so the session
   has no reason to live.
-- **Client-gone is terminal for the proxy side but does not imply action-gone.**
-  The action runs to completion regardless of whether a debugger is attached, so
-  a client detach reaps the *session state* but does not stop execution.
+- **Client-gone reaps the session and (MVP) terminates the action.** When the
+  proxy's terminal `Close` reaches the forwarder, the relay reaps the session
+  state *and* the worker terminates the action (see the "Terminate the action on
+  debug-session-end" decision below). This is a deliberate coupling: a debug run
+  exists to be debugged, so when the debugger leaves we end the run rather than
+  letting it continue unattended. Letting the action keep running after a detach
+  is an attach-style feature punted past the MVP.
 - On reap, the relay closes the surviving peer's stream with a status so its edge
   stops reconnecting and propagates the end downward; teardown is **idempotent**
   (both edges may signal end concurrently).
@@ -535,11 +539,22 @@ data flow.
 
   This makes the open-vs-resume distinction in `Hello` (§7.3) load-bearing, and
   is enforced structurally: only the open path can create a session.
-- **Detach-while-paused worker-slot hazard — terminate on a configurable
-  timeout.** Rather than make the proxy DAP-aware, the worker side terminates the
-  action process after a **configurable timeout** once the debug session has ended
-  / the client is gone, so a debuggee left suspended at a breakpoint cannot pin a
-  worker slot indefinitely. The timeout lives in the worker configuration.
+- **Terminate the action on debug-session-end — Decided (MVP: immediate, no
+  timer).** When the debug client goes away (the forwarder observes the proxy's
+  terminal `Close`), the worker **terminates the action**, immediately and
+  unconditionally — no grace period, no configurable timeout. This is both the
+  fix for the detach-while-paused worker-slot hazard (a debuggee left suspended at
+  a breakpoint cannot pin a slot) and the natural model for a *launched* debuggee:
+  like quitting gdb on a program it started, ending the debugger ends the run.
+  - The DAP `disconnect`/`terminate` semantics (incl. `terminateDebuggee`) are
+    handled **end-to-end** by the real client and adapter, flowing opaquely
+    through the relay *before* the socket closes; the worker's terminate is a
+    backstop, not the primary mechanism, and needs no DAP awareness.
+  - **Known simplification:** this overrides a clean
+    `disconnect{terminateDebuggee: false}` "detach and let it finish unattended"
+    intent — which we can't see without parsing DAP anyway. Acceptable for the
+    MVP; proper **attach-style** semantics (detach-and-keep-running, re-attach)
+    are punted to a post-MVP feature.
 
 ### 5.5 Triggering debug mode — **Decided**
 An action opts into debugging by carrying the `BB_DEBUG_SESSION_ID` environment
@@ -579,6 +594,8 @@ add it.
 - Having the relay understand, validate, or transform DAP messages.
 - Multiplexing multiple simultaneous debug sessions per action (revisit later).
 - Debugging actions that have already completed.
+- Attach-style semantics (detach-and-keep-running, re-attach mid-action): the MVP
+  terminates the action when the debugger leaves (§5.4).
 
 ## 7. Next steps
 
