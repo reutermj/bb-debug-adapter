@@ -21,10 +21,11 @@ We deliberately scope this down:
 - We only support **DAP servers that listen on a TCP port** inside the action
   environment. DAP servers that speak over stdin/stdout are explicitly out of
   scope for the first iteration.
-- The new service we are designing is intentionally **dumb**: it is a
-  rendezvous buffer that holds DAP messages flowing in each direction between
-  the developer and the remote debug-adapter server. It does not parse or
-  interpret DAP.
+- The new service we are designing is intentionally **DAP-agnostic**: it is a
+  rendezvous buffer that holds DAP messages flowing in each direction between the
+  developer and the remote debug-adapter server. It implements reliable,
+  resumable message transport (sequencing, acks, replay) but never parses or
+  interprets DAP — "dumb about DAP," not logic-free.
 
 ## 2. Background: the existing Buildbarn architecture
 
@@ -103,32 +104,37 @@ Key points relevant to this design:
 3. The **`bb_worker`/`bb_runner` side forwards** that port: it dials the action's
    DAP port and bridges its bytes to/from the new relay service.
 
-4. The **new relay service is a simple bidirectional buffer**. It holds two
+4. The **new relay service is a per-session bidirectional buffer**. It holds two
    message streams per debug session — developer→server and server→developer —
-   and lets each side read what the other has written. It is transport, not
-   logic.
+   and lets each side read what the other has written. It is **DAP-agnostic
+   transport**: it implements reliable, resumable delivery but never parses or
+   interprets DAP.
 
 ## 4. Proposed integration
 
 We introduce one new component plus two thin adapters at the edges.
 
+The developer's proxy reaches the relay through the existing `bb_storage`
+frontend, which demuxes the `DebugAdapterRelay` methods and forwards them to a
+separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
+another gRPC client of the same service (it may reach `bb_dap_relay` via the
+frontend or, being an internal farm component, directly).
+
 ```
- Developer's machine                     Build farm
+ Developer's machine            Build farm
  ┌──────────────────────┐
  │  DAP client (VS Code) │
  │          │ TCP        │
- │          ▼            │
- │  Local DAP proxy      │           ┌──────────────────────┐
- │  server (NEW)         │ ───────▶  │   DAP Relay service   │
- │                       │ ◀───────  │   (NEW, "the buffer") │
- └──────────────────────┘  session   │  per-session, two     │
-                            keyed     │  directional queues   │
-                            stream    └──────────┬───────────┘
-                                                 ▲
-                                                 │ session-keyed stream
-                                                 │
-                                      ┌──────────┴───────────┐
-                                      │  bb_worker / bb_runner│
+ │          ▼            │       ┌──────────────┐ fwd  ┌────────────────────┐
+ │  Local DAP proxy      │ gRPC  │ bb_storage   │─────▶│  bb_dap_relay      │
+ │  server (NEW)         │ ────▶ │ frontend     │◀─────│  (NEW, "the buffer")│
+ │                       │ ◀──── │ (demux only) │      │  per-session, two   │
+ └──────────────────────┘       └──────────────┘      │  directional logs   │
+                                                       └─────────┬──────────┘
+                                       gRPC (via frontend, or    ▲
+                                       direct from the worker)   │
+                                      ┌──────────────────────┐   │
+                                      │  bb_worker            │───┘
                                       │  port-forwarder (NEW) │
                                       │          │ TCP        │
                                       │          ▼            │
@@ -143,7 +149,7 @@ We introduce one new component plus two thin adapters at the edges.
 
 | Component | Where it runs | Responsibility |
 |---|---|---|
-| **DAP Relay service** (new) | On the farm, reachable from both workers and developer machines (like `bb_storage`/`bb_scheduler`) | Per-session bidirectional message buffer. Accepts writes from each side, serves them to the other. No DAP awareness. |
+| **DAP Relay service** (`bb_dap_relay`, new) | A separate farm backend, fronted by the `bb_storage` frontend that demuxes/forwards to it (§5.2); single node for the MVP | Per-session bidirectional message buffer. Implements reliable, resumable, sequenced delivery between the two sides, but is **DAP-agnostic** (never parses payloads). |
 | **Local DAP proxy** (new) | Developer's machine | Listens on a local TCP port for the DAP client. Bridges that connection to the relay service for a given session key. |
 | **Worker/runner port-forwarder** (new) | Inside `bb_worker`/`bb_runner`, concurrent with `Runner.Run` | Dials the action's DAP TCP port and bridges it to the relay service for the matching session key. |
 
@@ -347,10 +353,12 @@ That is achieved by two things together:
 uses LSP-style framing — a `Content-Length: <n>\r\n\r\n` header followed by `n`
 bytes of JSON — which is trivial to parse (read the header, read `n` bytes; no
 JSON parsing needed). The proxy and forwarder each read a *complete* DAP message
-off their TCP socket and hand it to the relay as one discrete payload, and in
-the reverse direction re-frame a discrete payload back onto TCP. The relay
-therefore deals only in **discrete opaque payloads** — message-oriented (so a
-reconnect never resumes mid-message) while remaining fully DAP-agnostic.
+off their TCP socket — header included — and hand it to the relay **verbatim** as
+one discrete payload; in the reverse direction they write that payload back onto
+TCP **unchanged** (no re-framing, no reconstruction). The relay therefore deals
+only in **discrete opaque payloads** — message-oriented (so a reconnect never
+resumes mid-message) while remaining fully DAP-agnostic, and the original bytes
+are preserved exactly end to end.
 
 **Handshake / who waits.** DAP's handshake is client-driven: the client sends
 `initialize`, then `launch`/`attach`, and the remote side (the DAP *server*)
@@ -422,9 +430,10 @@ ack**, not by any gRPC transport signal.
 - **Other GC levers (kept):** *piggybacked acks* (carry the ack `seq` on data
   flowing the other way — an optimization); *whole-session teardown GC* (drop the
   entire buffer on session end); and a **hard-cap safety valve** — if the unacked
-  window exceeds a configured size/age, the session is **aborted** (evicting an
-  unacked message would corrupt the DAP session, so the cap must abort, not
-  silently drop).
+  window exceeds a **hard-coded byte cap**, the session is **aborted** (evicting
+  an unacked message would corrupt the DAP session, so the cap must abort, not
+  silently drop). See the "Buffer cap" decision below for the punt to a simple
+  hard-coded size (no age dimension, no tuning) in the MVP.
 
 **Session materialization — Decided: lazy first-touch, symmetric, implicit.**
 A session springs into existence the moment the **first** edge connects with a
@@ -484,7 +493,12 @@ to the proxy.
 - **Reconnect grace window** — how long to retain a session after a stream drops
   with *no* terminal marker, before giving up on replay.
 - **Orphan timeout** — materialized, but the second edge never connects.
-- **Idle timeout** — both edges gone / no activity.
+- **Idle timeout** — fires on a session whose edges are **disconnected** (no live
+  gRPC stream / no keepalive heartbeat), not on a healthy-but-quiet one. A
+  developer paused at a breakpoint with both streams up and heartbeating is a
+  perfectly live session and must **not** be reaped, however long the quiet
+  lasts; idleness is measured by absence of connections, never by absence of DAP
+  traffic.
 
 **Buffer cap — Decided (punted): hard-coded max bytes, abort on exceed.** The
 relay caps the retained (unacked) bytes per session; if the buffer exceeds that
@@ -552,11 +566,18 @@ session to the identity that submitted the build, and enforcing it at the relay
 — is explicitly deferred to a later iteration. This is a security gap we are
 accepting only for the MVP.
 
+One concrete consequence to record: because a new stream for a
+`{session_key, side}` **takes over** from any existing one (the same mechanism
+that makes reconnect work, see `relay-protocol.md` §6.1), anyone who knows the
+UUID can evict the active proxy/forwarder. This is the same UUID-only-gate gap as
+above, not separate new work; closing it falls out of real authorization when we
+add it.
+
 ## 6. Explicit non-goals (first iteration)
 
 - Supporting DAP servers that communicate over stdin/stdout.
 - Having the relay understand, validate, or transform DAP messages.
-- Multiplexing multiple simultaneous debug sessions per action (revisit later
+- Multiplexing multiple simultaneous debug sessions per action (revisit later).
 - Debugging actions that have already completed.
 
 ## 7. Next steps

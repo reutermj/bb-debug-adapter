@@ -100,10 +100,10 @@ the connecting edge. Every edge stream has exactly:
 
 The `side` in `Hello` fixes the mapping:
 
-| `side`   | edge       | outbound | inbound |
-|----------|------------|----------|---------|
-| `CLIENT` | proxy      | `C2S`    | `S2C`   |
-| `SERVER` | forwarder  | `S2C`    | `C2S`   |
+| `side`      | edge       | outbound | inbound |
+|-------------|------------|----------|---------|
+| `PROXY`     | proxy      | `C2S`    | `S2C`   |
+| `FORWARDER` | forwarder  | `S2C`    | `C2S`   |
 
 This is what makes the grammar symmetric — both edges run identical logic; only
 the direction mapping differs.
@@ -180,10 +180,13 @@ message Hello {
   }
 }
 
+// Which edge this stream is. Named for the role on the build, not the DAP role,
+// to avoid colliding with gRPC "client/server" (both edges are gRPC clients of
+// the relay).
 enum Side {
   SIDE_UNSPECIFIED = 0;
-  CLIENT = 1;  // developer-side proxy; produces client->server
-  SERVER = 2;  // worker-side forwarder; produces server->client
+  PROXY     = 1;  // developer-side proxy; produces client->server
+  FORWARDER = 2;  // worker-side forwarder; produces server->client
 }
 
 // Fresh attach. The edge does not assume a pre-existing session: if absent, the
@@ -292,6 +295,17 @@ The handshake (6.1) re-establishes both resume points; retained frames are
 replayed; dedupe absorbs any overlap. Neither DAP endpoint observes more than a
 pause.
 
+> **Invariant (MUST):** a reconnect uses `Resume` with the edge's true inbound
+> high-water; `Open` is only for a side's genuine first attach. Misusing `Open`
+> to reconnect implies "deliver my inbound from seq 1," but the relay has already
+> GC'd frames the peer acked, so it cannot replay them — an unfillable gap. The
+> MVP edges (proxy and forwarder are both our code) simply obey this, and the
+> relay does **not** defend against a violating `Open`. A defensive relay-side
+> check (reject/normalize an `Open` for a side that already has delivery
+> progress) is **deferred** (§10) — note that a process *crash* of an edge is not
+> a reconnect at all (its local TCP dies, ending the session), so there is no
+> legitimate `Open`-after-progress case to handle for the MVP.
+
 ## 7. Termination
 
 Two distinct termination paths, distinguished so the consuming edge knows whether
@@ -354,7 +368,10 @@ This is the §5.4 decision encoded structurally in the `Hello.attach` oneof —
   reconnect before reaping. (Configurable, §5.4.)
 - **Orphan timeout** — materialized, but the second side never connects.
   (Configurable.)
-- **Idle timeout** — no progress / both edges gone. (Configurable.)
+- **Idle timeout** — fires only on a session whose edges are **disconnected** (no
+  live stream / no keepalive heartbeat), never on a healthy-but-quiet one. A
+  developer paused at a breakpoint with both streams up is fully live and is not
+  reaped regardless of how long there is no DAP traffic. (Configurable.)
 - **Byte cap** — hard-coded maximum retained (unacked) bytes per session; exceed
   ⇒ abort with `RESOURCE_EXHAUSTED` (§5.4). Not configurable in the MVP.
 - **Backpressure** — below the cap, HTTP/2 flow control pauses the source DAP
@@ -386,3 +403,7 @@ not part of this protocol.
   `FAILED_PRECONDITION`, and `ABORTED` vs. `CANCELLED` for reap/supersede.
 - **Heartbeats** — rely on gRPC keepalive PINGs to detect half-open streams, or
   add an application-level heartbeat? (§5.4 leans on keepalive.)
+- **Defensive handling of a misused `Open`** (deferred, §6.3) — should the relay
+  reject or normalize an `Open` for a `{session_key, side}` that already has
+  delivery progress, rather than trusting edges to reconnect with `Resume`? Out
+  of scope for the MVP (we own both edges); revisit if third-party edges appear.
