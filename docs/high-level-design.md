@@ -608,9 +608,10 @@ add it.
 4. ~~Specify the shared edge-client behavior~~ — drafted in
    [`edge-client.md`](edge-client.md): the protocol-facing half both edges share
    (handshake, seq/ack, retain/replay, dedupe, reconnect, termination, framing).
-5. Specify the worker/runner forwarder and how it discovers the action's port
-   (§5.3) — including reading `BB_DEBUG_SESSION_ID` from the `Command`. Builds on
-   the edge-client (§7.4) as `side = FORWARDER`.
+5. ~~Specify the worker/runner forwarder~~ — drafted in
+   [`forwarder.md`](forwarder.md) (§7.4): `side = FORWARDER`, reads
+   `BB_DEBUG_SESSION_ID` from the `Command`, injects `BB_DEBUG_PORT`, retry-dials
+   the action, terminates the action on debug-session-end.
 6. Specify the local proxy and how a developer configures/launches it (the CLI
    takes the session key and the frontend endpoint). Builds on the edge-client as
    `side = PROXY`.
