@@ -465,10 +465,20 @@ to the proxy.
 - **Orphan timeout** — materialized, but the second edge never connects.
 - **Idle timeout** — both edges gone / no activity.
 
+**Buffer cap — Decided (punted): hard-coded max bytes, abort on exceed.** The
+relay caps the retained (unacked) bytes per session; if the buffer exceeds that
+cap, the session is **aborted** (consistent with "evicting an unacked message
+would corrupt the session, so the cap must abort, not silently drop"). For the
+MVP the cap is a **hard-coded constant** — no config knob, no separate age cap,
+and no attempt to distinguish "pure backpressure up to the cap." We deliberately
+do **not** tune this now: debug traffic is low-volume and interactive, so the cap
+is a pathological-case safety valve that should never fire in the common MVP
+path. This is **not a one-way door** — making the cap configurable, adding an age
+dimension, or unifying it with the teardown reconnect-grace window are all
+backward-compatible refinements that change a number/policy, not the protocol or
+data flow.
+
 Still open:
-- **Backpressure-vs-abort threshold.** The concrete cap (bytes/messages/age) at
-  which the safety valve fires, and whether the relay blocks (pure backpressure)
-  right up to that cap.
 - **Teardown timeout values.** Concrete durations for the reconnect grace,
   orphan, and idle timeouts above.
 - **Peer-facing end semantics.** Whether the proxy surfaces a clean DAP
@@ -483,9 +493,6 @@ Still open:
   suspended, hanging the action (and its worker slot) until the action timeout.
   Mitigation (e.g. the proxy injecting a DAP `disconnect` on client loss) is
   DAP-aware proxy behavior and is deferred, but noted for its farm-cost impact.
-- **What happens to an in-flight session when the action exits or times out**
-  (the DAP server goes away) — surface a clean DAP `terminated`/`exited` to the
-  client, or just close?
 
 ### 5.5 Triggering debug mode — **Partially decided**
 An action opts into debugging by carrying the `BB_DEBUG_SESSION_ID` environment
