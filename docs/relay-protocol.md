@@ -217,17 +217,28 @@ message Frame {
     Close close   = 3;  // terminal end of this direction (ordered after last payload)
   }
 
-  // Optional optimization (§5.4 "piggybacked acks"): cumulative ack for the
-  // direction flowing the other way on this stream. 0 means "no piggybacked
-  // ack"; MVP implementations may ignore this and use standalone Ack only.
+  // Reserved for a future optimization (§5.4 "piggybacked acks"): cumulative ack
+  // for the direction flowing the other way on this stream. MVP senders set this
+  // to 0 and send standalone Ack messages only; MVP receivers ignore it. Emitting
+  // it later must stay purely additive (never a substitute for standalone Acks
+  // unless the receiver is known to consume it), so it cannot silently stall GC.
   uint64 piggyback_ack_through = 4;
 }
 
 // Graceful terminal close of a direction, produced by that direction's producer
-// when its local TCP closes. Reason is informational only — neither the relay
-// nor the edges synthesize any DAP terminated/exited message (§5.4).
+// when its local TCP closes. ALL fields are informational only (for logs and
+// telemetry) — neither the relay nor the edges turn any of them into a DAP
+// terminated/exited message (§5.4).
 message Close {
   CloseReason reason = 1;
+
+  // Action exit code, set by the forwarder on PROCESS_EXITED when known
+  // (Runner.Run surfaces it). Unset/absent otherwise (e.g. proxy-side close).
+  optional int32 exit_code = 2;
+
+  // Free-form human-readable detail for logs (e.g. "killed by signal 9",
+  // "client closed socket"). Never parsed; safe to leave empty.
+  string detail = 3;
 }
 
 enum CloseReason {
@@ -282,7 +293,9 @@ production* (via the first `Ack`).
 - The relay forwards frames each way, sends receipt-acks for what it has
   buffered, applies delivery-acks to GC, and bounds memory via HTTP/2 flow
   control (backpressure to the live DAP endpoint, §5.4).
-- `Ack`s may be sent standalone or piggybacked (`piggyback_ack_through`).
+- **MVP: standalone `Ack` messages only.** Debug traffic is low-volume and
+  interactive, so the piggyback optimization buys nothing; `piggyback_ack_through`
+  stays 0 and is ignored (it is reserved for a later revision).
 
 ### 6.3 Reconnect (transient drop)
 
@@ -344,8 +357,28 @@ drain). The edge treats these as terminal: close local TCP, do **not** reconnect
 | Idle / orphan reap while connected | `ABORTED` | Reaped by a lifecycle timeout (§8). |
 | Superseded by a newer stream | `ABORTED` | Another stream attached for the same `{session_key, side}`. |
 
-By contrast, a bare transport failure / `UNAVAILABLE` / `DEADLINE_EXCEEDED` is
-**transient** → reconnect with `Resume` (§6.3).
+**Terminal vs. transient — the edge's rule.** The edge decides whether to
+reconnect purely from how the stream ended:
+
+- **Terminal (do not reconnect; close local TCP):** an in-band `Close` for the
+  inbound direction (§7.1), or a stream that fails with `NOT_FOUND`,
+  `RESOURCE_EXHAUSTED`, or `ABORTED`.
+- **Transient (reconnect with `Resume`, §6.3):** any other stream/transport
+  failure — `UNAVAILABLE`, `DEADLINE_EXCEEDED`, connection reset, keepalive
+  timeout, etc.
+
+`NOT_FOUND` and `RESOURCE_EXHAUSTED` are deliberately *not* in the transient set
+even though a naive client might retry them — retrying a tombstoned or
+cap-aborted session cannot succeed. `DEADLINE_EXCEEDED` is treated as transient
+(transport-level), which is why it is **not** reused for lifecycle reaps; those
+use `ABORTED`.
+
+**`ABORTED` and your own reconnect.** During a normal reconnect the relay closes
+the *old* stream with `ABORTED` ("superseded") — but that is the edge superseding
+*itself*. An edge therefore treats `ABORTED` on a stream it has **already
+replaced** as cleanup to ignore, and `ABORTED` on its **current/only** stream as
+terminal (it was reaped, or superseded by someone else under the §5.6 no-auth
+gap). The distinction is "do I have a newer stream?", not the status code.
 
 ### 7.3 Reaped-session reconnect (tombstone, never re-materialize)
 
@@ -377,6 +410,18 @@ This is the §5.4 decision encoded structurally in the `Hello.attach` oneof —
 - **Backpressure** — below the cap, HTTP/2 flow control pauses the source DAP
   endpoint rather than growing the buffer unbounded (§5.4).
 
+**Liveness detection — gRPC keepalive PINGs; no application heartbeat.** A
+half-open stream (peer vanished without a clean close) is detected via HTTP/2
+keepalive PINGs, configured on both the edge and the relay; the resulting stream
+error is what flips the relay from GC to *retain-for-replay* and starts the
+reconnect-grace timer, and what tells an edge to reconnect. We add **no**
+application-level heartbeat message for the MVP — it would be redundant with
+keepalive and add DAP-agnostic chatter. Keepalive timing is configurable; the
+keepalive timeout should be comfortably shorter than the reconnect-grace and idle
+timeouts so a dead stream is noticed well before a session would be reaped. (Set
+the relay's server-side keepalive enforcement policy to permit the edges' client
+keepalives.)
+
 The **detach-while-paused worker-slot hazard** (§5.4) is handled by the *worker*
 terminating the action on a configurable timeout once the session ends; it is
 not part of this protocol.
@@ -390,20 +435,26 @@ not part of this protocol.
   for a `{session_key, side}` is a takeover, not multiplexing.
 - **Surviving a relay-process crash** — single non-replicated node (§5.2).
 
-## 10. Open refinement questions
+## 10. Refinement questions
 
-- **Piggybacked acks in the MVP** — include the field now (done) but defer
-  actually emitting it? Or implement from the start?
-- **`Close` detail fields** — do we want an optional action exit code / signal on
-  `Close` for logging/telemetry, even though it is never turned into DAP?
-- **Frontend↔relay hop** — confirmed as a transparent gRPC forward of the same
-  proto (no internal proto). Validate this against the frontend's existing
-  forwarding facilities.
-- **Status-code choices** — confirm `NOT_FOUND` for tombstone vs.
-  `FAILED_PRECONDITION`, and `ABORTED` vs. `CANCELLED` for reap/supersede.
-- **Heartbeats** — rely on gRPC keepalive PINGs to detect half-open streams, or
-  add an application-level heartbeat? (§5.4 leans on keepalive.)
-- **Defensive handling of a misused `Open`** (deferred, §6.3) — should the relay
-  reject or normalize an `Open` for a `{session_key, side}` that already has
-  delivery progress, rather than trusting edges to reconnect with `Resume`? Out
-  of scope for the MVP (we own both edges); revisit if third-party edges appear.
+### Resolved
+- **Piggybacked acks** — field reserved (`Frame.piggyback_ack_through`) but
+  **unused in the MVP**; standalone `Ack` only (§6.2). Emitting it later must stay
+  purely additive.
+- **`Close` detail fields** — **yes**, informational only: `Close` carries an
+  optional `exit_code` and a free-form `detail` string for logs/telemetry,
+  never turned into DAP (§5 proto).
+- **Status codes** — `NOT_FOUND` (tombstone), `RESOURCE_EXHAUSTED` (byte cap),
+  `ABORTED` (reap/supersede). Terminal-vs-transient rule spelled out in §7.2.
+  `FAILED_PRECONDITION` rejected for tombstone (retry can't help) and
+  `DEADLINE_EXCEEDED`/`CANCELLED` avoided for reaps (they read as transient).
+- **Heartbeats** — gRPC keepalive PINGs; **no** application heartbeat (§8).
+
+### Still deferred
+- **Frontend↔relay hop** — taken as a transparent gRPC forward of the same proto
+  (no internal proto). Still to *validate* against the frontend's existing
+  forwarding facilities when we build it.
+- **Defensive handling of a misused `Open`** (§6.3) — whether the relay should
+  reject/normalize an `Open` for a `{session_key, side}` that already has delivery
+  progress, rather than trusting edges to reconnect with `Resume`. Out of scope
+  for the MVP (we own both edges); revisit if third-party edges appear.
