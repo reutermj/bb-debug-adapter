@@ -405,13 +405,26 @@ ack**, not by any gRPC transport signal.
   unacked message would corrupt the DAP session, so the cap must abort, not
   silently drop).
 
+**Session materialization — Decided: lazy first-touch, symmetric, implicit.**
+A session springs into existence the moment the **first** edge connects with a
+given `session_key`; the relay allocates the per-session state (the two
+directional logs) as a side effect of that first `Hello{session_key, side}`
+message. There is no `CreateSession` RPC and no designated "creator" side —
+either the proxy or the forwarder may arrive first, and the second edge simply
+attaches to the already-materialized session. This is the natural realization of
+the store-and-forward semantics above ("a side may connect before its peer … its
+messages queue and are delivered when the peer appears; there is no special
+rendezvous handshake"). We knowingly accept that, with auth deferred (§5.6), any
+connection bearing any UUID allocates state — abuse mitigation is out of scope
+for the MVP and the unguessable key is the only gate.
+
 Still open:
 - **Backpressure-vs-abort threshold.** The concrete cap (bytes/messages/age) at
   which the safety valve fires, and whether the relay blocks (pure backpressure)
   right up to that cap.
-- **Session creation and teardown.** When is a session first materialized, and
-  when is it garbage-collected — on action exit, on explicit DAP `disconnect`,
-  on an idle timeout after both sides leave?
+- **Session teardown / GC.** Materialization is settled (above); teardown is not.
+  When is a session garbage-collected — on action exit, on explicit DAP
+  `disconnect`, on an idle timeout after both sides leave?
 - **What happens to an in-flight session when the action exits or times out**
   (the DAP server goes away) — surface a clean DAP `terminated`/`exited` to the
   client, or just close?
