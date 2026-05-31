@@ -227,6 +227,22 @@ the same way and reuses the frontend's endpoint, TLS, and auth. The worker-side
 forwarder is then just another gRPC *client* of that service, exactly as workers
 are already clients of storage.
 
+**This requires an upstream code change — by design.** "Registers the same way"
+describes a reusable *pattern*, not a drop-in plugin. The frontend's service list
+is a **compile-time closure** passed to `bb_grpc.NewServersFromConfigurationAndServe`
+(`bb-storage/cmd/bb_storage/main.go` — each service is an explicit
+`Register…Server(s, impl)` call inside the `func(s grpc.ServiceRegistrar)`
+callback). There is no config- or plugin-driven service registration: nothing in
+`GrpcServers` config can add a service, so a `DebugAdapterRelay` can only join the
+server by a `RegisterDebugAdapterRelayServer(s, impl)` call compiled into whatever
+binary runs the frontend. Concretely that means either (a) modifying/forking
+`bb_storage`'s `main.go` to add the line, or (b) building a custom frontend binary
+that imports bb-storage as a library and supplies its own registration closure
+covering both the storage services and the relay (the idiomatic Buildbarn
+composition pattern). We expect and accept this upstream change; the benefit is
+that once registered, the relay transparently inherits the frontend's listen
+address, TLS, and auth interceptors — no new endpoint, port, or transport stack.
+
 Still open: whether the relay's per-session buffer lives **in** the frontend
 process or in a **separate backend** that the frontend fronts (analogous to how
 the frontend fronts the scheduler for Execution), and how that interacts with a
