@@ -562,9 +562,10 @@ accepting only for the MVP.
 
 1. Agree on the high-level shape in this document.
 2. ~~Pick a session-identity scheme~~ — decided: env-var session key (§5.1).
-   Confirm the relay reachability model (§5.2) — frontend-hosted service, with
-   the in-process-vs-backend question still open.
-3. Define the relay service's gRPC/streaming protocol and proto messages.
+   ~~Confirm the relay reachability model~~ — decided (§5.2): frontend demuxes
+   and forwards to a separate single-node `bb_dap_relay` service.
+3. ~~Define the relay service's gRPC/streaming protocol and proto messages~~ —
+   drafted in [`relay-protocol.md`](relay-protocol.md) (§7.3); under refinement.
 4. Specify the worker/runner forwarder and how it discovers the action's port
    (§5.3) — including reading `BB_DEBUG_SESSION_ID` from the `Command`.
 5. Specify the local proxy and how a developer configures/launches it (the CLI
