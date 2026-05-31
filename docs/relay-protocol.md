@@ -24,9 +24,12 @@ Recap of the already-made decisions this grammar is built around:
 - **Store-and-forward, message-oriented** (§5.4). Two independent directions per
   session, each an ordered log of discrete whole DAP messages with a
   per-direction sequence number.
-- **Framing at the edges, not the relay** (§5.4). Edges read a complete DAP
-  message off TCP (LSP `Content-Length` framing), hand the relay one discrete
-  opaque payload, and re-frame on the way out. The relay never parses DAP.
+- **Framing at the edges, not the relay** (§5.4). An edge reads the LSP
+  `Content-Length` header only far enough to delimit one complete message, then
+  hands the relay that **whole message verbatim — header bytes included** — as a
+  single opaque payload. The consuming edge writes those bytes straight back to
+  TCP with no re-framing. The relay never parses DAP, and the edges never
+  reconstruct framing (the original bytes are preserved exactly).
 - **Disconnect tolerance via sequence numbers + replay** (§5.4). A transient gRPC
   stream drop does not perturb the DAP endpoints; the edge reconnects and
   resumes exactly where it left off, with no loss or duplication.
@@ -204,7 +207,8 @@ message Frame {
   uint64 seq = 1;  // per-direction, monotonic from 1, assigned by the producer
 
   oneof kind {
-    bytes payload = 2;  // exactly one whole DAP message, LSP frame stripped
+    bytes payload = 2;  // one whole DAP message, carried verbatim INCLUDING its
+                        // LSP Content-Length frame; written to TCP unchanged
     Close close   = 3;  // terminal end of this direction (ordered after last payload)
   }
 
@@ -264,8 +268,9 @@ where to resume *outbound production* (via the first `Ack`).
   read off its local TCP, assigning the next outbound seq. It retains each frame
   until a receipt-`Ack` covers it.
 - **Consuming:** edge receives inbound `Frame`s, **dedupes** any
-  `seq ≤ inbound_delivered_through` (defensive backstop, §5.4), writes payloads to
-  its local TCP **in seq order**, and sends a delivery-`Ack{through}` as it does.
+  `seq ≤ inbound_delivered_through` (defensive backstop, §5.4), writes each
+  payload (already a fully-framed DAP message) to its local TCP verbatim **in seq
+  order**, and sends a delivery-`Ack{through}` as it does.
 - The relay forwards frames each way, sends receipt-acks for what it has
   buffered, applies delivery-acks to GC, and bounds memory via HTTP/2 flow
   control (backpressure to the live DAP endpoint, §5.4).
@@ -359,10 +364,6 @@ not part of this protocol.
 
 ## 10. Open refinement questions
 
-- **Payload framing detail.** This draft carries the DAP message body with the
-  LSP `Content-Length` header **stripped**, re-framed at the consuming edge.
-  Confirm vs. carrying the raw framed bytes opaquely (even dumber relay, slightly
-  larger payloads).
 - **Piggybacked acks in the MVP** — include the field now (done) but defer
   actually emitting it? Or implement from the start?
 - **`Close` detail fields** — do we want an optional action exit code / signal on
