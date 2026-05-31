@@ -587,8 +587,13 @@ add it.
    ~~Confirm the relay reachability model~~ — decided (§5.2): frontend demuxes
    and forwards to a separate single-node `bb_dap_relay` service.
 3. ~~Define the relay service's gRPC/streaming protocol and proto messages~~ —
-   drafted in [`relay-protocol.md`](relay-protocol.md) (§7.3); under refinement.
-4. Specify the worker/runner forwarder and how it discovers the action's port
-   (§5.3) — including reading `BB_DEBUG_SESSION_ID` from the `Command`.
-5. Specify the local proxy and how a developer configures/launches it (the CLI
-   takes the session key and the frontend endpoint).
+   drafted in [`relay-protocol.md`](relay-protocol.md) (§7.3); refinements closed.
+4. ~~Specify the shared edge-client behavior~~ — drafted in
+   [`edge-client.md`](edge-client.md): the protocol-facing half both edges share
+   (handshake, seq/ack, retain/replay, dedupe, reconnect, termination, framing).
+5. Specify the worker/runner forwarder and how it discovers the action's port
+   (§5.3) — including reading `BB_DEBUG_SESSION_ID` from the `Command`. Builds on
+   the edge-client (§7.4) as `side = FORWARDER`.
+6. Specify the local proxy and how a developer configures/launches it (the CLI
+   takes the session key and the frontend endpoint). Builds on the edge-client as
+   `side = PROXY`.
