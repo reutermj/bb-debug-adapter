@@ -77,8 +77,8 @@ Key points relevant to this design:
 
 2. **`Runner.Run` is synchronous and blocking.** `bb_worker` calls
    `Runner.Run` (`pkg/proto/runner/runner.proto`) and the call only returns
-   once the action process has exited. See
-   `bb-remote-execution/pkg/builder/local_build_executor.go:280`. There is no
+   once the action process has exited. See the `runner.Run` call in
+   `bb-remote-execution/pkg/builder/local_build_executor.go`. There is no
    existing interactive side channel during execution. Any debug forwarding has
    to happen *concurrently* with an in-flight `Run` call.
 
@@ -115,10 +115,10 @@ Key points relevant to this design:
 We introduce one new component plus two thin adapters at the edges.
 
 The developer's proxy reaches the relay through the existing `bb_storage`
-frontend, which demuxes the `DebugAdapterRelay` methods and forwards them to a
-separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
-another gRPC client of the same service (it may reach `bb_dap_relay` via the
-frontend or, being an internal farm component, directly).
+frontend, which routes the `DebugAdapterRelay` service and forwards its stream to
+a separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
+another gRPC client of the same service; being an internal farm component, it
+dials `bb_dap_relay` directly rather than through the frontend (§5.2).
 
 ```
  Developer's machine            Build farm
@@ -131,8 +131,8 @@ frontend or, being an internal farm component, directly).
  │                       │ ◀──── │ (demux only) │      │  per-session, two   │
  └──────────────────────┘       └──────────────┘      │  directional logs   │
                                                        └─────────┬──────────┘
-                                       gRPC (via frontend, or    ▲
-                                       direct from the worker)   │
+                                       gRPC (direct from the     ▲
+                                       worker, not via frontend) │
                                       ┌──────────────────────┐   │
                                       │  bb_worker            │───┘
                                       │  port-forwarder (NEW) │
@@ -194,7 +194,8 @@ Why an environment variable and not the other candidates:
   (`platform/trie.go` — only the instance name is prefix-matched, not the
   properties). A per-session-unique value in `Platform` therefore produces a
   brand-new platform string that **no worker advertises**, so the action routes
-  to an empty queue and never schedules (`in_memory_build_queue.go:512,528`).
+  to an empty queue and never schedules (the platform-queue lookup in
+  `in_memory_build_queue.go` fails its longest-prefix match).
   `--remote_default_exec_properties=<unique>` would break execution outright.
 - **Not the action digest.** The worker knows it, but it is content-addressed
   (not unique per session, not secret) and the developer cannot easily single
@@ -221,40 +222,71 @@ would change how the key is produced and delivered, but not the relay protocol
 or the overall data flow. We start with the env var for simplicity and revisit
 if a less manual / more automatic identity scheme is warranted.
 
-### 5.2 How the developer's traffic reaches the relay — **Decided: frontend-fronted gRPC service backed by a separate `bb_dap_relay`**
+### 5.2 How the developer's traffic reaches the relay — **Decided: config-driven frontend relay to a separate `bb_dap_relay`**
 
-Preferred direction: the relay is a **new gRPC service hosted on the existing
-`bb_storage` frontend**, so the developer's proxy connects only to the frontend
-it already uses, and gRPC routes to the new service by method name. This mirrors
-how `bb_storage` already registers many services (CAS, ByteStream, ActionCache,
-Execution, Capabilities) on a single server via one `ServiceRegistrar`
-(`bb-storage/cmd/bb_storage/main.go`); a `DebugAdapterRelay` service registers
-the same way and reuses the frontend's endpoint, TLS, and auth. The worker-side
-forwarder is then just another gRPC *client* of that service, exactly as workers
-are already clients of storage.
+Direction: the developer's proxy connects only to the **existing `bb_storage`
+frontend** it already uses, and the frontend forwards the `DebugAdapterRelay`
+stream to a separate `bb_dap_relay` backend. The proxy thus reuses the frontend's
+endpoint, TLS, and (eventually) auth, and never needs a new port or transport
+stack. The worker-side forwarder is just another gRPC *client* of the relay
+(dialing `bb_dap_relay` directly, §4).
 
-**This requires an upstream code change — by design.** "Registers the same way"
-describes a reusable *pattern*, not a drop-in plugin. The frontend's service list
-is a **compile-time closure** passed to `bb_grpc.NewServersFromConfigurationAndServe`
-(`bb-storage/cmd/bb_storage/main.go` — each service is an explicit
-`Register…Server(s, impl)` call inside the `func(s grpc.ServiceRegistrar)`
-callback). There is no config- or plugin-driven service registration: nothing in
-`GrpcServers` config can add a service, so a `DebugAdapterRelay` can only join the
-server by a `RegisterDebugAdapterRelayServer(s, impl)` call compiled into whatever
-binary runs the frontend. Concretely that means either (a) modifying/forking
-`bb_storage`'s `main.go` to add the line, or (b) building a custom frontend binary
-that imports bb-storage as a library and supplies its own registration closure
-covering both the storage services and the relay (the idiomatic Buildbarn
-composition pattern). We expect and accept this upstream change; the benefit is
-that once registered, the relay transparently inherits the frontend's listen
-address, TLS, and auth interceptors — no new endpoint, port, or transport stack.
+**This needs no `bb_storage` code change — it is config-driven.** `bb_storage`
+already ships a **generic, transparent, bidirectional stream relay** that routes
+by gRPC **service name** to a backend, configured purely through the
+`GrpcServers` config — no recompilation, no forked `main.go`. The pieces:
+
+- `ServerRelayConfiguration` (`bb-storage/pkg/proto/configuration/grpc/grpc.proto`,
+  the `relays` field of a gRPC server) takes `{ endpoint, services: [...] }`.
+- For each listed service, the server installs `NewForwardingStreamHandler`
+  (`bb-storage/pkg/grpc/forwarding_stream_handler.go`) — a generic handler that
+  opens a **bidirectional** backend stream (`ServerStreams` *and* `ClientStreams`
+  true), pumps both directions, and treats every message as opaque
+  (`emptypb.Empty`), so it never parses the payload.
+- These are wired by service name via `NewRoutingStreamHandler`
+  (`routing_stream_handler.go`) registered as the server's gRPC
+  `UnknownServiceHandler` (`pkg/grpc/server.go`), so any service **not** statically
+  registered on the frontend falls through to the relay route.
+
+So fronting the relay is a config entry on the frontend's gRPC server, e.g.:
+
+```jsonnet
+relays: [{
+  endpoint: { address: 'bb_dap_relay:…', /* TLS, keepalive, … */ },
+  services: ['buildbarn.daprelay.v1.DebugAdapterRelay'],
+}]
+```
+
+Because `DebugAdapterRelay` is not statically registered on the frontend, the
+unknown-service handler catches it and transparently forwards the `Attach` bidi
+stream to `bb_dap_relay`. (This corrects an earlier draft of this section, which
+claimed the frontend's service list was a compile-time closure requiring a
+forked `main.go`; the `relays` facility post-dates that reasoning.)
+
+Three things to **validate** when we build against this facility, none expected to
+be blockers (tracked in relay-protocol §10):
+
+- **Payload fidelity.** The forwarder round-trips each message through
+  `emptypb.Empty`; protobuf stores unrecognized fields as raw bytes and re-emits
+  them verbatim, and the load-bearing DAP bytes live in `Frame.payload` (a `bytes`
+  field), which round-trips losslessly — confirm this preserves payloads exactly,
+  since the end-to-end "verbatim bytes" guarantee (§5.4) rides on it.
+- **Half-open propagation.** The relay flips to retain-for-replay on a stream
+  error (§5.4); on the proxy leg the proxy's keepalive now terminates at the
+  *frontend*, so confirm a dead proxy↔frontend stream promptly tears down the
+  frontend↔relay backend stream (the forwarder cancels its context on incoming
+  error, which should), and configure keepalive on the frontend↔relay client leg.
+- **Connection-age churn.** If the frontend sets `MaxConnectionAge`, it will
+  periodically recycle the proxy's stream; harmless (the protocol resumes via
+  `Resume`, §5.4) but means the proxy sees policy-driven reconnects, not just
+  network blips.
 
 **Buffer location — Decided: a separate `bb_dap_relay` service.** The per-session
 buffer lives in its own backend service, **not** in the frontend process. The
-`bb_storage` frontend's only role is to be the single gRPC endpoint that demuxes
-the `DebugAdapterRelay` methods (by method name) and **forwards** them to
-`bb_dap_relay` — exactly analogous to how the frontend fronts the scheduler for
-Execution. This keeps the buffer's memory and lifecycle out of the
+`bb_storage` frontend's only role is to be the single gRPC endpoint that routes
+the `DebugAdapterRelay` service (by service name) and **transparently forwards**
+the stream to `bb_dap_relay` — analogous to how the frontend can relay other
+services. This keeps the buffer's memory and lifecycle out of the
 latency-sensitive storage frontend.
 
 **Multi-replica — Decided (MVP): a single `bb_dap_relay` node.** There is exactly
@@ -277,10 +309,11 @@ break this assumption and need revisiting.)
 
 **Port discovery — Decided: deterministic per-thread port from worker config.**
 `bb_worker` spawns exactly `RunnerConfiguration.Concurrency` execution threads,
-each with a stable `threadID ∈ [0, Concurrency)` (`cmd/bb_worker/main.go:362`,
-already surfaced as `workerID["thread"]`), and the entire per-thread executor
-stack is constructed inside that loop. We add a `debug_port_range_start` to the
-runner configuration and assign each thread the port `start + threadID`:
+each with a stable `threadID ∈ [0, Concurrency)` (the per-thread executor loop
+in `cmd/bb_worker/main.go`, already surfaced as `workerID["thread"]`), and the
+entire per-thread executor stack is constructed inside that loop. We add a
+`debug_port_range_start` to the runner configuration and assign each thread the
+port `start + threadID`:
 
 - The range is naturally per-runner (`[start, start + concurrency)`), since
   `Concurrency` is per-runner.
@@ -597,21 +630,25 @@ add it.
 - Attach-style semantics (detach-and-keep-running, re-attach mid-action): the MVP
   terminates the action when the debugger leaves (§5.4).
 
-## 7. Next steps
+## 7. Related documents
 
-1. Agree on the high-level shape in this document.
-2. ~~Pick a session-identity scheme~~ — decided: env-var session key (§5.1).
-   ~~Confirm the relay reachability model~~ — decided (§5.2): frontend demuxes
-   and forwards to a separate single-node `bb_dap_relay` service.
-3. ~~Define the relay service's gRPC/streaming protocol and proto messages~~ —
-   drafted in [`relay-protocol.md`](relay-protocol.md) (§7.3); refinements closed.
-4. ~~Specify the shared edge-client behavior~~ — drafted in
-   [`edge-client.md`](edge-client.md): the protocol-facing half both edges share
-   (handshake, seq/ack, retain/replay, dedupe, reconnect, termination, framing).
-5. ~~Specify the worker/runner forwarder~~ — drafted in
-   [`forwarder.md`](forwarder.md) (§7.4): `side = FORWARDER`, reads
-   `BB_DEBUG_SESSION_ID` from the `Command`, injects `BB_DEBUG_PORT`, retry-dials
-   the action, terminates the action on debug-session-end.
-6. ~~Specify the local proxy~~ — drafted in [`proxy.md`](proxy.md) (§7.5):
-   `side = PROXY`, CLI (`--session-id`, `--frontend`, `--listen`), local DAP
-   listener via the frontend, terminate-on-detach, attach-timeout UX.
+This document fixes the high-level shape; the follow-up specs below turn each
+decision into a concrete design. They cross-reference each other by the informal
+section numbers in parentheses (e.g. "§7.3" = the relay protocol).
+
+- **§7.3 — relay protocol** ([`relay-protocol.md`](relay-protocol.md)). The
+  gRPC service, proto messages, sequencing/acks, resume-on-reconnect, and
+  termination between an edge and `bb_dap_relay`.
+- **relay server** ([`relay-server.md`](relay-server.md)). The `bb_dap_relay`
+  server side: per-session state, materialization, buffering/GC, resume,
+  termination, and reaping.
+- **shared edge-client** ([`edge-client.md`](edge-client.md)). The
+  protocol-facing half both edges share: handshake, seq/ack, retain/replay,
+  dedupe, reconnect, termination, framing.
+- **§7.4 — worker-side forwarder** ([`forwarder.md`](forwarder.md)).
+  `side = FORWARDER`: reads `BB_DEBUG_SESSION_ID` from the `Command`, injects
+  `BB_DEBUG_PORT`, retry-dials the action, terminates the action on
+  debug-session-end.
+- **§7.5 — local proxy** ([`proxy.md`](proxy.md)). `side = PROXY`: CLI
+  (`--session-id`, `--frontend`, `--listen`), local DAP listener via the
+  frontend, terminate-on-detach, attach-timeout UX.

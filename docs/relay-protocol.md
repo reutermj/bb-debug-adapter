@@ -14,8 +14,9 @@ developer-side **proxy** or the worker-side **forwarder**) and the **relay**
 sequencing/acknowledgement, resume-on-reconnect, and termination.
 
 It does **not** specify the proxy or forwarder internals (those are §7.4/§7.5),
-nor anything inside the DAP payloads — the relay is DAP-agnostic (§5.4) and
-treats every payload as opaque bytes.
+the relay's server-side behavior ([`relay-server.md`](relay-server.md)), nor
+anything inside the DAP payloads — the relay is DAP-agnostic (§5.4) and treats
+every payload as opaque bytes.
 
 ## 2. Design inputs (what this protocol must satisfy)
 
@@ -46,7 +47,7 @@ Recap of the already-made decisions this grammar is built around:
 - **One shared RPC + `side` field as the MVP default** (§5.4, relaxed). Not a
   hard requirement; the load-bearing invariant is a single shared message
   grammar so one client library serves both edges.
-- **Single `bb_dap_relay` node; frontend demuxes and forwards** (§5.2).
+- **Single `bb_dap_relay` node; frontend routes and forwards by service name** (§5.2).
 - **Hard-coded byte cap, abort on exceed; no auth** (§5.4, §5.6) for the MVP.
 
 ## 3. Topology and transport
@@ -62,15 +63,16 @@ Recap of the already-made decisions this grammar is built around:
    └───────────────┘                   └──────────────┘
 ```
 
-- Both edges call the **same `Attach` RPC** on the `bb_storage` frontend's gRPC
-  endpoint. The frontend demuxes `DebugAdapterRelay` by method name (§5.2) and
-  **transparently forwards** the bidirectional stream to the single
-  `bb_dap_relay` node — it does **not** parse stream messages. The protocol is
-  therefore defined **end-to-end between an edge and the relay**; the frontend is
-  a passthrough. This is why §5.4 reasons about "two hops around the relay"
-  (`forwarder → relay`, `relay → proxy`) and treats the frontend as transparent.
-- A deployment **may** let the worker forwarder dial `bb_dap_relay` directly
-  (it is an internal farm component) instead of via the frontend; the proto is
+- Both edges call the **same `Attach` RPC**; only the endpoint they dial
+  differs. The **proxy** dials the `bb_storage` frontend, which routes
+  `DebugAdapterRelay` by service name (§5.2) and **transparently forwards** the
+  bidirectional stream to the single `bb_dap_relay` node — it does **not** parse
+  stream messages. The protocol is therefore defined **end-to-end between an edge
+  and the relay**; the frontend is a passthrough. This is why §5.4 reasons about
+  "two hops around the relay" (`forwarder → relay`, `relay → proxy`) and treats
+  the frontend as transparent.
+- The worker forwarder dials `bb_dap_relay` **directly** — it is an internal
+  farm component (§5.2, forwarder §6), not via the frontend; the proto is
   identical either way. The developer proxy always goes via the frontend (the
   single endpoint it already trusts).
 - Transport security and (eventually) auth are inherited from the frontend
@@ -452,9 +454,18 @@ protocol.
 - **Heartbeats** — gRPC keepalive PINGs; **no** application heartbeat (§8).
 
 ### Still deferred
-- **Frontend↔relay hop** — taken as a transparent gRPC forward of the same proto
-  (no internal proto). Still to *validate* against the frontend's existing
-  forwarding facilities when we build it.
+- **Frontend↔relay hop** — a transparent gRPC forward of the same proto (no
+  internal proto). The facility exists and is config-driven: `bb_storage`'s
+  generic `relays` stream forwarder (`pkg/grpc/forwarding_stream_handler.go` +
+  `routing_stream_handler.go`, §5.2) routes `DebugAdapterRelay` by service name
+  to `bb_dap_relay` over a bidi stream, no `bb_storage` code change. Three things
+  to *validate* when we build against it (none expected to block): (a) **payload
+  fidelity** — the forwarder round-trips messages through `emptypb.Empty`, so
+  confirm `Frame.payload` bytes are preserved exactly; (b) **half-open
+  propagation** — confirm a dead proxy↔frontend stream promptly tears down the
+  frontend↔relay leg so the relay flips to retain-for-replay, and set keepalive on
+  that leg; (c) **connection-age churn** — a frontend `MaxConnectionAge` recycles
+  the proxy stream periodically (harmless; resumes via `Resume`).
 - **Defensive handling of a misused `Open`** (§6.3) — whether the relay should
   reject/normalize an `Open` for a `{session_key, side}` that already has delivery
   progress, rather than trusting edges to reconnect with `Resume`. Out of scope
