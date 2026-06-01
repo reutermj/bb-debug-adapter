@@ -14,8 +14,9 @@ developer-side **proxy** or the worker-side **forwarder**) and the **relay**
 sequencing/acknowledgement, resume-on-reconnect, and termination.
 
 It does **not** specify the proxy or forwarder internals (those are §7.4/§7.5),
-nor anything inside the DAP payloads — the relay is DAP-agnostic (§5.4) and
-treats every payload as opaque bytes.
+the relay's server-side behavior ([`relay-server.md`](relay-server.md)), nor
+anything inside the DAP payloads — the relay is DAP-agnostic (§5.4) and treats
+every payload as opaque bytes.
 
 ## 2. Design inputs (what this protocol must satisfy)
 

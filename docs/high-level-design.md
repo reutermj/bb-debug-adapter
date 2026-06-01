@@ -639,6 +639,9 @@ section numbers in parentheses (e.g. "§7.3" = the relay protocol).
 - **§7.3 — relay protocol** ([`relay-protocol.md`](relay-protocol.md)). The
   gRPC service, proto messages, sequencing/acks, resume-on-reconnect, and
   termination between an edge and `bb_dap_relay`.
+- **relay server** ([`relay-server.md`](relay-server.md)). The `bb_dap_relay`
+  server side: per-session state, materialization, buffering/GC, resume,
+  termination, and reaping.
 - **shared edge-client** ([`edge-client.md`](edge-client.md)). The
   protocol-facing half both edges share: handshake, seq/ack, retain/replay,
   dedupe, reconnect, termination, framing.
