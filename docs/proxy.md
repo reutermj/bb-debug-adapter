@@ -39,10 +39,10 @@ The developer then points their DAP client (e.g. a VS Code attach config) at
 ## 3. Reaching the relay
 
 The proxy connects to the relay **through the `bb_storage` frontend** (§5.2) — the
-single endpoint it already trusts — which demuxes the `DebugAdapterRelay` methods
-and forwards them to `bb_dap_relay`. The proxy is just a gRPC client of that
+single endpoint it already trusts — which routes the `DebugAdapterRelay` service
+and forwards its stream to `bb_dap_relay`. The proxy is just a gRPC client of that
 service and inherits the frontend's transport security (and, eventually, auth;
-none in the MVP, §5.6). Unlike the forwarder (which may dial `bb_dap_relay`
+none in the MVP, §5.6). Unlike the forwarder (which dials `bb_dap_relay`
 directly), the proxy **always** goes via the frontend.
 
 ## 4. Lifecycle

@@ -115,8 +115,8 @@ Key points relevant to this design:
 We introduce one new component plus two thin adapters at the edges.
 
 The developer's proxy reaches the relay through the existing `bb_storage`
-frontend, which demuxes the `DebugAdapterRelay` methods and forwards them to a
-separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
+frontend, which routes the `DebugAdapterRelay` service and forwards its stream to
+a separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
 another gRPC client of the same service; being an internal farm component, it
 dials `bb_dap_relay` directly rather than through the frontend (§5.2).
 
@@ -222,40 +222,71 @@ would change how the key is produced and delivered, but not the relay protocol
 or the overall data flow. We start with the env var for simplicity and revisit
 if a less manual / more automatic identity scheme is warranted.
 
-### 5.2 How the developer's traffic reaches the relay — **Decided: frontend-fronted gRPC service backed by a separate `bb_dap_relay`**
+### 5.2 How the developer's traffic reaches the relay — **Decided: config-driven frontend relay to a separate `bb_dap_relay`**
 
-Preferred direction: the relay is a **new gRPC service hosted on the existing
-`bb_storage` frontend**, so the developer's proxy connects only to the frontend
-it already uses, and gRPC routes to the new service by method name. This mirrors
-how `bb_storage` already registers many services (CAS, ByteStream, ActionCache,
-Execution, Capabilities) on a single server via one `ServiceRegistrar`
-(`bb-storage/cmd/bb_storage/main.go`); a `DebugAdapterRelay` service registers
-the same way and reuses the frontend's endpoint, TLS, and auth. The worker-side
-forwarder is then just another gRPC *client* of that service, exactly as workers
-are already clients of storage.
+Direction: the developer's proxy connects only to the **existing `bb_storage`
+frontend** it already uses, and the frontend forwards the `DebugAdapterRelay`
+stream to a separate `bb_dap_relay` backend. The proxy thus reuses the frontend's
+endpoint, TLS, and (eventually) auth, and never needs a new port or transport
+stack. The worker-side forwarder is just another gRPC *client* of the relay
+(dialing `bb_dap_relay` directly, §4).
 
-**This requires an upstream code change — by design.** "Registers the same way"
-describes a reusable *pattern*, not a drop-in plugin. The frontend's service list
-is a **compile-time closure** passed to `bb_grpc.NewServersFromConfigurationAndServe`
-(`bb-storage/cmd/bb_storage/main.go` — each service is an explicit
-`Register…Server(s, impl)` call inside the `func(s grpc.ServiceRegistrar)`
-callback). There is no config- or plugin-driven service registration: nothing in
-`GrpcServers` config can add a service, so a `DebugAdapterRelay` can only join the
-server by a `RegisterDebugAdapterRelayServer(s, impl)` call compiled into whatever
-binary runs the frontend. Concretely that means either (a) modifying/forking
-`bb_storage`'s `main.go` to add the line, or (b) building a custom frontend binary
-that imports bb-storage as a library and supplies its own registration closure
-covering both the storage services and the relay (the idiomatic Buildbarn
-composition pattern). We expect and accept this upstream change; the benefit is
-that once registered, the relay transparently inherits the frontend's listen
-address, TLS, and auth interceptors — no new endpoint, port, or transport stack.
+**This needs no `bb_storage` code change — it is config-driven.** `bb_storage`
+already ships a **generic, transparent, bidirectional stream relay** that routes
+by gRPC **service name** to a backend, configured purely through the
+`GrpcServers` config — no recompilation, no forked `main.go`. The pieces:
+
+- `ServerRelayConfiguration` (`bb-storage/pkg/proto/configuration/grpc/grpc.proto`,
+  the `relays` field of a gRPC server) takes `{ endpoint, services: [...] }`.
+- For each listed service, the server installs `NewForwardingStreamHandler`
+  (`bb-storage/pkg/grpc/forwarding_stream_handler.go`) — a generic handler that
+  opens a **bidirectional** backend stream (`ServerStreams` *and* `ClientStreams`
+  true), pumps both directions, and treats every message as opaque
+  (`emptypb.Empty`), so it never parses the payload.
+- These are wired by service name via `NewRoutingStreamHandler`
+  (`routing_stream_handler.go`) registered as the server's gRPC
+  `UnknownServiceHandler` (`pkg/grpc/server.go`), so any service **not** statically
+  registered on the frontend falls through to the relay route.
+
+So fronting the relay is a config entry on the frontend's gRPC server, e.g.:
+
+```jsonnet
+relays: [{
+  endpoint: { address: 'bb_dap_relay:…', /* TLS, keepalive, … */ },
+  services: ['buildbarn.daprelay.v1.DebugAdapterRelay'],
+}]
+```
+
+Because `DebugAdapterRelay` is not statically registered on the frontend, the
+unknown-service handler catches it and transparently forwards the `Attach` bidi
+stream to `bb_dap_relay`. (This corrects an earlier draft of this section, which
+claimed the frontend's service list was a compile-time closure requiring a
+forked `main.go`; the `relays` facility post-dates that reasoning.)
+
+Three things to **validate** when we build against this facility, none expected to
+be blockers (tracked in relay-protocol §10):
+
+- **Payload fidelity.** The forwarder round-trips each message through
+  `emptypb.Empty`; protobuf stores unrecognized fields as raw bytes and re-emits
+  them verbatim, and the load-bearing DAP bytes live in `Frame.payload` (a `bytes`
+  field), which round-trips losslessly — confirm this preserves payloads exactly,
+  since the end-to-end "verbatim bytes" guarantee (§5.4) rides on it.
+- **Half-open propagation.** The relay flips to retain-for-replay on a stream
+  error (§5.4); on the proxy leg the proxy's keepalive now terminates at the
+  *frontend*, so confirm a dead proxy↔frontend stream promptly tears down the
+  frontend↔relay backend stream (the forwarder cancels its context on incoming
+  error, which should), and configure keepalive on the frontend↔relay client leg.
+- **Connection-age churn.** If the frontend sets `MaxConnectionAge`, it will
+  periodically recycle the proxy's stream; harmless (the protocol resumes via
+  `Resume`, §5.4) but means the proxy sees policy-driven reconnects, not just
+  network blips.
 
 **Buffer location — Decided: a separate `bb_dap_relay` service.** The per-session
 buffer lives in its own backend service, **not** in the frontend process. The
-`bb_storage` frontend's only role is to be the single gRPC endpoint that demuxes
-the `DebugAdapterRelay` methods (by method name) and **forwards** them to
-`bb_dap_relay` — exactly analogous to how the frontend fronts the scheduler for
-Execution. This keeps the buffer's memory and lifecycle out of the
+`bb_storage` frontend's only role is to be the single gRPC endpoint that routes
+the `DebugAdapterRelay` service (by service name) and **transparently forwards**
+the stream to `bb_dap_relay` — analogous to how the frontend can relay other
+services. This keeps the buffer's memory and lifecycle out of the
 latency-sensitive storage frontend.
 
 **Multi-replica — Decided (MVP): a single `bb_dap_relay` node.** There is exactly
