@@ -17,11 +17,9 @@ The proxy embeds an edge-client (`side = PROXY`); everything protocol-facing is
 the edge-client's, so the proxy itself is just the CLI, the stdio bridge, and the
 developer-facing UX.
 
-It is the mirror of the forwarder: same edge-client, opposite `side`, and both now
+It is the mirror of the forwarder: same edge-client, opposite `side`, and both
 bridge a **stdio** connection — the proxy its own stdin/stdout (to the DAP client),
-the forwarder the action's stdin/stdout (to the DAP adapter). Using DAP's native
-stdio transport on both ends means there is **no local port anywhere** in the
-system.
+the forwarder the action's stdin/stdout (to the DAP adapter).
 
 ## 2. CLI and configuration
 
@@ -35,10 +33,9 @@ placeholder), passing via the launch config:
 - **`--frontend=<endpoint>`** (+ TLS/credentials) — the `bb_storage` frontend gRPC
   endpoint to reach the relay through (§5.2).
 
-There is **no `--listen`** and no port: the proxy speaks DAP over the stdin/stdout
-the DAP client gives it when it spawns the adapter. In a VS Code launch config
-this is the adapter's command/args (e.g. a `debugAdapterExecutable` /
-`"type"`-registered adapter), not an `attach` host+port.
+The proxy speaks DAP over the stdin/stdout the DAP client gives it when it spawns
+the adapter. In a VS Code launch config this is the adapter's command/args (e.g. a
+`debugAdapterExecutable` / `"type"`-registered adapter).
 
 ## 3. Reaching the relay
 
@@ -100,7 +97,7 @@ Driven by the edge-client's terminal outcome (edge-client §9.4):
 
 DAP clients impose a timeout on the `initialize`/`attach` request (§5.4). Because
 the remote side may be slow to materialize — scheduling queue + input fetch before
-the action's DAP server is even listening — the client's `attach` can time out
+the action's DAP adapter is even running on stdio — the client's `attach` can time out
 while its request sits buffered at the relay. This is a **client-config / UX**
 concern, not a relay or proxy protocol issue (the proxy never fabricates a
 response, consistent with the no-synthesize decision, §5.4):
@@ -142,21 +139,15 @@ over from each other (protocol §6.1).
 
 - **No local network surface.** As a stdio adapter the proxy opens **no** local
   listening socket; it talks to the DAP client over inherited stdio and only dials
-  *outbound* to the frontend. There is no loopback port for other local processes
-  to reach.
+  *outbound* to the frontend.
 - Beyond that, the MVP's only access gate is the unguessable `session_key` UUID
   and the frontend's transport security (§5.6); real authorization is deferred.
 
 ## 10. Open questions
 
-- **Optional TCP-listen mode** — some workflows prefer a long-lived proxy the
-  client *attaches* to over a local port (a VS Code `attach` config), rather than
-  one the client launches over stdio. Offering an optional `--listen` mode
-  alongside the stdio default is a possible later convenience; it has none of the
-  farm-side port concerns (it is a single local port on the developer's machine).
-  Out of scope for the MVP.
 - **Proxy name / packaging** — final binary name, and whether it ships standalone
   or as a subcommand of an existing Buildbarn client tool.
-- **Pre-warming the session** — connect to the relay before the local DAP client
-  attaches (to materialize early), or only on accept (current MVP)? No protocol
-  benefit given store-and-forward; purely a UX/latency micro-question.
+- **Pre-warming the session** — connect to the relay immediately on startup (to
+  materialize early), or only once the DAP client's first message arrives (current
+  MVP)? No protocol benefit given store-and-forward; purely a UX/latency
+  micro-question.
