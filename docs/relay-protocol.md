@@ -29,7 +29,7 @@ Recap of the already-made decisions this grammar is built around:
   `Content-Length` header only far enough to delimit one complete message, then
   hands the relay that **whole message verbatim — header bytes included** — as a
   single opaque payload. The consuming edge writes those bytes straight back to
-  TCP with no re-framing. The relay never parses DAP, and the edges never
+  its local socket with no re-framing. The relay never parses DAP, and the edges never
   reconstruct framing (the original bytes are preserved exactly).
 - **Disconnect tolerance via sequence numbers + replay** (§5.4). A transient gRPC
   stream drop does not perturb the DAP endpoints; the edge reconnects and
@@ -42,7 +42,7 @@ Recap of the already-made decisions this grammar is built around:
 - **Lazy first-touch, symmetric materialization** (§5.4). The first edge to
   connect with a `session_key` materializes the session; no `CreateSession` RPC.
 - **Terminal-close marker + drain-then-drop teardown** (§5.4). A terminal close
-  (local TCP gone) is distinct from a transient stream drop and is ordered after
+  (local socket gone) is distinct from a transient stream drop and is ordered after
   the last message in its direction.
 - **One shared RPC + `side` field as the MVP default** (§5.4, relaxed). Not a
   hard requirement; the load-bearing invariant is a single shared message
@@ -116,7 +116,7 @@ There are two reliable hops around the relay, and the *meaning* of "I have
 through N" differs by node (§5.4):
 
 - **Delivery ack** — an **edge** acks its **inbound** direction once it has
-  written that message to its **local TCP** (the DAP client or DAP server, "the
+  written that message to its **local socket** (the DAP client or DAP server, "the
   right place"). This is what lets the **relay GC** its buffer for that
   direction.
 - **Receipt ack** — the **relay** acks an edge's **outbound** direction once it
@@ -203,7 +203,7 @@ message Open {}
 // "tombstone"), so the edge learns its session is gone instead of silently
 // landing in a fresh empty one (§5.4). Re-materialization is reserved for Open.
 message Resume {
-  // Highest INBOUND seq this edge has durably handled (written to local TCP).
+  // Highest INBOUND seq this edge has durably handled (written to local socket).
   // The relay resumes inbound delivery from here + 1.
   uint64 inbound_delivered_through = 1;
 }
@@ -215,7 +215,7 @@ message Frame {
 
   oneof kind {
     bytes payload = 2;  // one whole DAP message, carried verbatim INCLUDING its
-                        // LSP Content-Length frame; written to TCP unchanged
+                        // LSP Content-Length frame; written to the local socket unchanged
     Close close   = 3;  // terminal end of this direction (ordered after last payload)
   }
 
@@ -228,7 +228,7 @@ message Frame {
 }
 
 // Graceful terminal close of a direction, produced by that direction's producer
-// when its local TCP closes. ALL fields are informational only (for logs and
+// when its local socket closes. ALL fields are informational only (for logs and
 // telemetry) — neither the relay nor the edges turn any of them into a DAP
 // terminated/exited message (§5.4).
 message Close {
@@ -251,7 +251,7 @@ enum CloseReason {
 
 // Cumulative acknowledgement. "I have taken everything through `through` into
 // custody." Sent by a receiver; lets the corresponding sender drop frames <=
-// `through`. Custody = "written to local TCP" for an edge (delivery ack),
+// `through`. Custody = "written to local socket" for an edge (delivery ack),
 // "buffered" for the relay (receipt ack).
 message Ack {
   uint64 through = 1;
@@ -286,11 +286,11 @@ production* (via the first `Ack`).
 ### 6.2 Steady state
 
 - **Producing:** edge sends `Frame{seq, payload}` up for each whole DAP message
-  read off its local TCP, assigning the next outbound seq. It retains each frame
+  read off its local socket, assigning the next outbound seq. It retains each frame
   until a receipt-`Ack` covers it.
 - **Consuming:** edge receives inbound `Frame`s, **dedupes** any
   `seq ≤ inbound_delivered_through` (defensive backstop, §5.4), writes each
-  payload (already a fully-framed DAP message) to its local TCP verbatim **in seq
+  payload (already a fully-framed DAP message) to its local socket verbatim **in seq
   order**, and sends a delivery-`Ack{through}` as it does.
 - The relay forwards frames each way, sends receipt-acks for what it has
   buffered, applies delivery-acks to GC, and bounds memory via HTTP/2 flow
@@ -302,7 +302,7 @@ production* (via the first `Ack`).
 ### 6.3 Reconnect (transient drop)
 
 A stream that ends **without** an in-band `Close` and **without** a terminal
-status (§7) is a transient drop. The edge keeps its local TCP open, reconnects,
+status (§7) is a transient drop. The edge keeps its local socket open, reconnects,
 and sends `Hello{Resume{inbound_delivered_through = <last written>}}` — a
 reconnect always uses `Resume`, never `Open`, so a session the relay has already
 reaped surfaces as a `NOT_FOUND` tombstone rather than silently re-materializing.
@@ -318,7 +318,7 @@ pause.
 > relay does **not** defend against a violating `Open`. A defensive relay-side
 > check (reject/normalize an `Open` for a side that already has delivery
 > progress) is **deferred** (§10) — note that a process *crash* of an edge is not
-> a reconnect at all (its local TCP dies, ending the session), so there is no
+> a reconnect at all (its local socket dies, ending the session), so there is no
 > legitimate `Open`-after-progress case to handle for the MVP.
 
 ## 7. Termination
@@ -328,7 +328,7 @@ to reconnect:
 
 ### 7.1 Graceful close (drain-then-drop)
 
-When an edge's **local TCP closes** (DAP client quit, or action/DAP server
+When an edge's **local socket closes** (DAP client quit, or action/DAP server
 exited), its producer sends a terminal `Frame{seq, close}` as the **final entry**
 in its outbound direction, ordered after the last payload. The relay:
 
@@ -338,7 +338,7 @@ in its outbound direction, ordered after the last payload. The relay:
    `Close` seq (drain-then-drop, §5.4), or a timeout fires (§8).
 
 The consuming edge, upon writing all preceding payloads and seeing the inbound
-`Close`, closes its local TCP and **does not reconnect**. No DAP `terminated`/
+`Close`, closes its local socket and **does not reconnect**. No DAP `terminated`/
 `exited` is synthesized (§5.4) — the DAP endpoint simply sees its socket close,
 and any `terminated`/`exited` the remote adapter actually sent rode through as
 ordinary payloads beforehand.
@@ -350,7 +350,7 @@ must still drain to the proxy.
 ### 7.2 Relay-originated termination (abrupt)
 
 Conditions the relay raises by **failing the stream with a gRPC status** (no
-drain). The edge treats these as terminal: close local TCP, do **not** reconnect.
+drain). The edge treats these as terminal: close local socket, do **not** reconnect.
 
 | Condition | Status | Meaning |
 |---|---|---|
@@ -362,7 +362,7 @@ drain). The edge treats these as terminal: close local TCP, do **not** reconnect
 **Terminal vs. transient — the edge's rule.** The edge decides whether to
 reconnect purely from how the stream ended:
 
-- **Terminal (do not reconnect; close local TCP):** an in-band `Close` for the
+- **Terminal (do not reconnect; close local socket):** an in-band `Close` for the
   inbound direction (§7.1), or a stream that fails with `NOT_FOUND`,
   `RESOURCE_EXHAUSTED`, or `ABORTED`.
 - **Transient (reconnect with `Resume`, §6.3):** any other stream/transport

@@ -26,9 +26,9 @@ action ports, `bb_worker`, or CLIs.
 | Reconnect + resume, terminal-vs-transient | ✅ | — |
 | LSP frame delimiting (read/write verbatim) | ✅ | — |
 | gRPC keepalive | ✅ | — |
-| Obtaining the local `net.Conn` | — | listens (proxy) / dials with retry (forwarder) |
+| Obtaining the local `net.Conn` | — | binds own stdio (proxy) / accepts the build-dir socket carrying the action's stdio (forwarder) |
 | `CloseReason` + `exit_code` on local close | consumes | supplies |
-| Running concurrent with `Runner.Run`, port discovery, CLI, UX | — | ✅ |
+| Running concurrent with `Runner.Run`, stdio wiring, CLI, UX | — | ✅ |
 
 ## 2. The local stream and framing
 
@@ -203,17 +203,19 @@ The edge-client is parameterized by, and only by:
 - **Identity:** `session_key`, `side`.
 - **Relay access:** how to dial a fresh `Attach` stream (frontend/relay endpoint,
   credentials, keepalive params).
-- **Local connection:** the `net.Conn` to bridge (already accepted/dialed by the
-  edge layer).
+- **Local connection:** the `net.Conn` to bridge, already provided by the edge
+  layer — the proxy's own stdin/stdout, or the forwarder's accepted build-directory
+  socket carrying the action's stdio.
 - **Local-close reason source:** a value/callback yielding the `CloseReason`
   (+ `exit_code`, `detail`) to stamp on the terminal `Close` when the local side
   ends — this is where the forwarder injects the action's exit status.
 
 It exposes: **run until terminal**, returning the §9.4 outcome.
 
-Everything else — listening vs. dialing, retry-dialing the action port, port
-discovery, `BB_DEBUG_*` handling, the `Runner.Run` goroutine, CLI/UX — is the
-edge layer's and is **out of scope here** (it belongs in §7.4 / §7.5).
+Everything else — binding the proxy's stdio vs. accepting the forwarder's
+build-dir socket, the runner-side stdio wiring, `BB_DEBUG_SESSION_ID` handling, the
+`Runner.Run` goroutine, CLI/UX — is the edge layer's and is **out of scope here**
+(it belongs in §7.4 / §7.5).
 
 ## 12. Correctness invariants (checklist)
 

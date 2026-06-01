@@ -9,20 +9,24 @@
 
 ## 1. Role and placement
 
-The proxy runs on the **developer's machine**. It listens on a local TCP port for
-the DAP client and bridges that connection to the relay, hiding all of the
-remoting (§3 goals). Their DAP client connects to it exactly as if it were a
-normal, locally-hosted debug adapter. The proxy embeds an edge-client
-(`side = PROXY`); everything protocol-facing is the edge-client's, so the proxy
-itself is just the CLI, the local listener, and the developer-facing UX.
+The proxy runs on the **developer's machine** as a **stdio DAP adapter**: the DAP
+client (VS Code, etc.) launches it as a child process and speaks DAP over its
+**stdin/stdout**, exactly as it would any normal, locally-installed debug adapter.
+The proxy bridges that stdio to the relay, hiding all of the remoting (§3 goals).
+The proxy embeds an edge-client (`side = PROXY`); everything protocol-facing is
+the edge-client's, so the proxy itself is just the CLI, the stdio bridge, and the
+developer-facing UX.
 
-It is the mirror of the forwarder: same edge-client, opposite `side`, and its
-local socket is *accepted* (it listens) rather than *dialed*.
+It is the mirror of the forwarder: same edge-client, opposite `side`, and both now
+bridge a **stdio** connection — the proxy its own stdin/stdout (to the DAP client),
+the forwarder the action's stdin/stdout (to the DAP adapter). Using DAP's native
+stdio transport on both ends means there is **no local port anywhere** in the
+system.
 
 ## 2. CLI and configuration
 
-The developer launches the proxy with (names TBD; `bb_dap_proxy` as a
-placeholder):
+The DAP client launches the proxy as its adapter (names TBD; `bb_dap_proxy` as a
+placeholder), passing via the launch config:
 
 - **`--session-id=<uuid>`** — the same `BB_DEBUG_SESSION_ID` UUID the developer
   generated and passed to Bazel via `--action_env` (§5.1). This is the relay
@@ -30,11 +34,11 @@ placeholder):
   sides.
 - **`--frontend=<endpoint>`** (+ TLS/credentials) — the `bb_storage` frontend gRPC
   endpoint to reach the relay through (§5.2).
-- **`--listen=127.0.0.1:<port>`** — where the local DAP client connects. Defaults
-  to loopback (§9).
 
-The developer then points their DAP client (e.g. a VS Code attach config) at
-`--listen`.
+There is **no `--listen`** and no port: the proxy speaks DAP over the stdin/stdout
+the DAP client gives it when it spawns the adapter. In a VS Code launch config
+this is the adapter's command/args (e.g. a `debugAdapterExecutable` /
+`"type"`-registered adapter), not an `attach` host+port.
 
 ## 3. Reaching the relay
 
@@ -47,12 +51,13 @@ directly), the proxy **always** goes via the frontend.
 
 ## 4. Lifecycle
 
-1. **Start**: parse the CLI, prepare the relay gRPC client to the frontend, and
-   open the local listener on `--listen`.
-2. **Accept**: wait for the DAP client to connect. On accept, hand the connection
-   to the edge-client (edge-client §11) with `side = PROXY`, `session_key` from
-   `--session-id`, the frontend relay access, and the local-close reason
-   `LOCAL_PEER_DISCONNECTED`.
+1. **Start**: the DAP client spawns the proxy. Parse the CLI and prepare the relay
+   gRPC client to the frontend.
+2. **Bind stdio**: hand the proxy's own stdin/stdout to the edge-client
+   (edge-client §11) with `side = PROXY`, `session_key` from `--session-id`, the
+   frontend relay access, and the local-close reason `LOCAL_PEER_DISCONNECTED`.
+   (There is no accept step — the DAP client is already connected via the stdio it
+   launched the proxy with.)
 3. **Bridge**: the edge-client connects to the relay (`Open`, materializing the
    session via lazy first-touch if the forwarder has not yet attached, §5.4) and
    runs the protocol until a terminal outcome (§5). The client's `initialize` /
@@ -60,21 +65,21 @@ directly), the proxy **always** goes via the frontend.
    yet, they buffer at the relay and the normal DAP path "just works" once the
    forwarder attaches (§5.4) — modulo the attach-timeout caveat (§6).
 
-**One session per invocation (MVP).** The proxy handles a single DAP client
-connection for its `session_key`, then exits when that session ends. This is a
-natural consequence of terminate-on-detach (§5.4 "Terminate the action on
-debug-session-end"): once the DAP client
-disconnects, the action is terminated, so there is nothing to re-attach to.
-Debugging again means a fresh build with a fresh UUID. (Re-accepting sequential
-connections is a possible later refinement, §10.)
+**One session per invocation (MVP).** Each launch of the proxy serves one DAP
+client (the one that spawned it) for its `session_key`, then exits when that
+session ends. This is a natural consequence of terminate-on-detach (§5.4
+"Terminate the action on debug-session-end"): once the DAP client disconnects, the
+action is terminated, so there is nothing to re-attach to. Debugging again means a
+fresh build with a fresh UUID — and, since the client launches the proxy, a fresh
+proxy process.
 
 ## 5. Termination
 
 Driven by the edge-client's terminal outcome (edge-client §9.4):
 
 - **`PeerClosed`** (the action exited / the forwarder sent `Close`): the
-  edge-client has already written all preceding payloads and then closes the
-  local DAP socket with a plain FIN — the DAP client sees its session end. Nothing
+  edge-client has already written all preceding payloads and then closes its stdio
+  to the DAP client (the proxy exits) — the DAP client sees its session end. Nothing
   is synthesized (§5.4); any `terminated`/`exited` the remote adapter emitted
   already arrived as ordinary payloads. The proxy reports the end to the developer
   (e.g. "session ended — process exited, code N", from the `Close` detail) and
@@ -85,7 +90,7 @@ Driven by the edge-client's terminal outcome (edge-client §9.4):
   (§5.4 "Terminate the action on debug-session-end"). The proxy reports and exits.
 - **`Tombstone`** (`NOT_FOUND`): a reconnect found the session reaped (e.g. the
   action exited and was reaped during a relay-stream gap). The edge-client closes
-  the local DAP socket; the proxy reports "session is gone" and exits. (The first
+  its stdio to the DAP client; the proxy reports "session is gone" and exits. (The first
   connect is always `Open`, so this only arises on a post-drop `Resume`,
   protocol §7.3.)
 - **`Aborted` / `CapExceeded`**: the relay tore the session down (reap, supersede,
@@ -110,7 +115,7 @@ response, consistent with the no-synthesize decision, §5.4):
 Symmetric to the forwarder's open coupling question (forwarder §8), but
 developer-facing. If
 the frontend/relay is unreachable, the edge-client keeps retrying (reconnect
-backoff, edge-client §8) while the local DAP socket is open; the DAP client sees
+backoff, edge-client §8) while the DAP client's stdio is open; the DAP client sees
 only a pause. Because failures here are seen by a human, the proxy should emit
 **clear diagnostics** — cannot reach frontend, TLS/cert problems, session gone —
 rather than silently retrying forever with no feedback.
@@ -122,10 +127,11 @@ Tying together §4.2 of the high-level design:
 1. Generate a UUID: `export BB_DEBUG_SESSION_ID=$(uuidgen)`.
 2. Start the build so the target action is debuggable, e.g.
    `bazel build //target --action_env=BB_DEBUG_SESSION_ID` (and whatever makes the
-   action start a DAP server on `127.0.0.1:$BB_DEBUG_PORT`, §forwarder).
-3. Launch the proxy:
-   `bb_dap_proxy --session-id=$BB_DEBUG_SESSION_ID --frontend=<endpoint> --listen=127.0.0.1:<port>`.
-4. Point the DAP client (a VS Code attach config) at `127.0.0.1:<port>` and debug.
+   action run a DAP adapter on stdio, e.g. `lldb-dap`, §forwarder).
+3. Configure the DAP client (a VS Code launch config) to use the proxy as its
+   adapter command:
+   `bb_dap_proxy --session-id=$BB_DEBUG_SESSION_ID --frontend=<endpoint>`.
+4. Start debugging; the client launches the proxy and speaks DAP over its stdio.
 
 The developer must ensure exactly **one** debuggable action carries the
 `session_key` (scope the `--action_env` to a single target/test); multiplexing is
@@ -134,17 +140,21 @@ over from each other (protocol §6.1).
 
 ## 9. Security
 
-- **Bind loopback by default** (`127.0.0.1`): the proxy is a local adapter for the
-  developer's own DAP client; it should not be exposed on the network.
+- **No local network surface.** As a stdio adapter the proxy opens **no** local
+  listening socket; it talks to the DAP client over inherited stdio and only dials
+  *outbound* to the frontend. There is no loopback port for other local processes
+  to reach.
 - Beyond that, the MVP's only access gate is the unguessable `session_key` UUID
   and the frontend's transport security (§5.6); real authorization is deferred.
 
 ## 10. Open questions
 
-- **Sequential re-accept** — should the proxy, after a session ends, listen for
-  another DAP client connection (with a fresh `Open`), or exit (current MVP)?
-  Limited value while terminate-on-detach kills the action, but relevant if
-  attach-style semantics are added later (a non-goal today).
+- **Optional TCP-listen mode** — some workflows prefer a long-lived proxy the
+  client *attaches* to over a local port (a VS Code `attach` config), rather than
+  one the client launches over stdio. Offering an optional `--listen` mode
+  alongside the stdio default is a possible later convenience; it has none of the
+  farm-side port concerns (it is a single local port on the developer's machine).
+  Out of scope for the MVP.
 - **Proxy name / packaging** — final binary name, and whether it ships standalone
   or as a subcommand of an existing Buildbarn client tool.
 - **Pre-warming the session** — connect to the relay before the local DAP client

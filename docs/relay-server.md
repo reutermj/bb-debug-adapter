@@ -147,7 +147,7 @@ arriving from this stream is a **delivery-ack for the direction this side
 - **Receipt-ack drives the *producer's* drop, not the relay's.** The relay keeps a
   frame until it is **delivery**-acked — `Send()` to the consumer is not delivery
   (protocol §4.3). Custody only transfers when the consumer confirms it wrote the
-  frame to its local TCP.
+  frame to its local socket.
 - **Byte cap — hard-coded, per session, abort on exceed.** The relay bounds the
   total `retained` bytes across both directions of a session by a hard-coded
   constant. On exceed it **aborts the whole session** with `RESOURCE_EXHAUSTED`
@@ -156,7 +156,8 @@ arriving from this stream is a **delivery-ack for the direction this side
   safety valve that should never fire.
 
 **Backpressure — the cap is the bound; flow control is best-effort.** high-level
-§5.4 describes HTTP/2 flow control "propagating backpressure to the source TCP."
+§5.4 describes HTTP/2 flow control "propagating backpressure to the source DAP
+endpoint."
 That holds only loosely once the relay is store-and-forwarding, because to buffer
 for an absent or slow peer the relay must **decouple** the two legs — and each
 edge's frames *and* its delivery-acks ride the **same** bidi stream, so a relay

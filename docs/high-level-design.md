@@ -18,9 +18,12 @@ locally.
 
 We deliberately scope this down:
 
-- We only support **DAP servers that listen on a TCP port** inside the action
-  environment. DAP servers that speak over stdin/stdout are explicitly out of
-  scope for the first iteration.
+- We support **DAP adapters that speak DAP over stdin/stdout** — the default,
+  native DAP transport (the mode in which a DAP client normally launches an
+  adapter as a child process). The debuggable action *is* (or launches) such an
+  adapter. Adapters that **only** listen on a TCP port and cannot speak stdio are
+  out of scope for the first iteration; a user-supplied stdio↔socket wrapper can
+  bridge them if needed.
 - The new service we are designing is intentionally **DAP-agnostic**: it is a
   rendezvous buffer that holds DAP messages flowing in each direction between the
   developer and the remote debug-adapter server. It implements reliable,
@@ -98,11 +101,13 @@ Key points relevant to this design:
    client (VS Code, etc.) connects to it exactly as if it were a normal,
    locally-hosted debug adapter. The proxy hides all of the remoting.
 
-2. The **remote debug-adapter server** runs as (or alongside) the action inside
-   `bb_runner`, listening on a TCP port in the action environment.
+2. The **remote debug adapter** runs as (or is launched by) the action inside
+   `bb_runner`, speaking DAP over its **stdin/stdout** — the native DAP transport.
 
-3. The **`bb_worker`/`bb_runner` side forwards** that port: it dials the action's
-   DAP port and bridges its bytes to/from the new relay service.
+3. The **`bb_worker`/`bb_runner` side forwards** the action's stdio: the runner
+   wires the action's stdin/stdout to a Unix-domain socket in the shared build
+   directory (teeing stdout so the normal action log is still captured), and the
+   worker bridges those bytes to/from the new relay service.
 
 4. The **new relay service is a per-session bidirectional buffer**. It holds two
    message streams per debug session — developer→server and server→developer —
@@ -124,10 +129,10 @@ dials `bb_dap_relay` directly rather than through the frontend (§5.2).
  Developer's machine            Build farm
  ┌──────────────────────┐
  │  DAP client (VS Code) │
- │          │ TCP        │
+ │          │ stdio      │  (client launches the proxy as a stdio adapter)
  │          ▼            │       ┌──────────────┐ fwd  ┌────────────────────┐
  │  Local DAP proxy      │ gRPC  │ bb_storage   │─────▶│  bb_dap_relay      │
- │  server (NEW)         │ ────▶ │ frontend     │◀─────│  (NEW, "the buffer")│
+ │  adapter (NEW)        │ ────▶ │ frontend     │◀─────│  (NEW, "the buffer")│
  │                       │ ◀──── │ (demux only) │      │  per-session, two   │
  └──────────────────────┘       └──────────────┘      │  directional logs   │
                                                        └─────────┬──────────┘
@@ -135,13 +140,21 @@ dials `bb_dap_relay` directly rather than through the frontend (§5.2).
                                        worker, not via frontend) │
                                       ┌──────────────────────┐   │
                                       │  bb_worker            │───┘
-                                      │  port-forwarder (NEW) │
-                                      │          │ TCP        │
-                                      │          ▼            │
-                                      │  Remote DAP server    │
-                                      │  (the action), on a   │
-                                      │  port in the action   │
-                                      │  environment          │
+                                      │  forwarder (NEW)      │
+                                      │          ▲            │
+                                      │          │ build-dir  │
+                                      │          │ UDS        │
+                                      │  ┌───────┴─────────┐  │
+                                      │  │  bb_runner      │  │
+                                      │  │  wires action   │  │
+                                      │  │  stdin/stdout   │  │
+                                      │  │  to the UDS     │  │
+                                      │  │      │ stdio     │  │
+                                      │  │      ▼           │  │
+                                      │  │  Remote DAP      │  │
+                                      │  │  adapter (the    │  │
+                                      │  │  action)         │  │
+                                      │  └─────────────────┘  │
                                       └──────────────────────┘
 ```
 
@@ -150,20 +163,24 @@ dials `bb_dap_relay` directly rather than through the frontend (§5.2).
 | Component | Where it runs | Responsibility |
 |---|---|---|
 | **DAP Relay service** (`bb_dap_relay`, new) | A separate farm backend, fronted by the `bb_storage` frontend that demuxes/forwards to it (§5.2); single node for the MVP | Per-session bidirectional message buffer. Implements reliable, resumable, sequenced delivery between the two sides, but is **DAP-agnostic** (never parses payloads). |
-| **Local DAP proxy** (new) | Developer's machine | Listens on a local TCP port for the DAP client. Bridges that connection to the relay service for a given session key. |
-| **Worker/runner port-forwarder** (new) | Inside `bb_worker`/`bb_runner`, concurrent with `Runner.Run` | Dials the action's DAP TCP port and bridges it to the relay service for the matching session key. |
+| **Local DAP proxy** (new) | Developer's machine | A stdio DAP adapter the DAP client launches. Bridges its own stdin/stdout to the relay service for a given session key. |
+| **Worker/runner forwarder** (new) | The relay-facing half in `bb_worker` (concurrent with `Runner.Run`); a minimal stdio-wiring step in `bb_runner` | The runner wires the action's stdin/stdout to a build-directory Unix-domain socket (teeing stdout to the normal log). The worker accepts that socket and bridges the bytes to the relay service for the matching session key. |
 
 ### 4.2 Data flow for one debug session
 
 0. The developer generates a session key (UUID) and starts the build with it set
    as an action environment variable (`BB_DEBUG_SESSION_ID`, via `--action_env`),
    passing the same key to the local proxy (see §5.1).
-1. The action starts on the runner and brings up a DAP server on a known port.
-2. The worker reads `BB_DEBUG_SESSION_ID` from the action's `Command`, and the
-   forwarder dials that port and registers with the relay under that session key.
-3. The developer points their DAP client at the local proxy; the proxy connects
-   to the relay under the same session key.
-4. DAP messages flow developer→proxy→relay→forwarder→DAP server and back, with
+1. The worker reads `BB_DEBUG_SESSION_ID` from the action's `Command`. Because the
+   action is debuggable, the worker creates a Unix-domain socket in the build
+   directory, passes its path to the runner, and the runner wires the action's
+   stdin/stdout to that socket (teeing stdout to the normal action log) before
+   spawning the action. The action runs a DAP adapter that speaks DAP over stdio.
+2. The worker's forwarder accepts the build-directory socket and registers with
+   the relay under that session key.
+3. The developer's DAP client launches the local proxy (a stdio adapter); the
+   proxy connects to the relay under the same session key.
+4. DAP messages flow developer→proxy→relay→forwarder→DAP adapter and back, with
    the relay simply buffering and handing messages across.
 
 ## 5. Design decisions and open questions
@@ -303,65 +320,93 @@ scaling (session affinity / shared state across multiple relay replicas) for the
 MVP; a single node sidesteps it entirely. Scaling out is a later, backward-
 compatible concern.
 
-### 5.3 Concurrency with the blocking `Run` call — **Partially narrowed**
+### 5.3 Concurrency with the blocking `Run` call — **Decided (stdio over a build-dir socket)**
 The forwarder must run while `Runner.Run` is in flight.
 
-Network reachability is **not** a blocker: actions are spawned as ordinary child
-processes of `bb_runner` (optionally `chroot`'d into the input root,
-`cmd/bb_runner/main.go`), with **no network-namespace isolation by default**.
-The action's DAP server on `127.0.0.1:<port>` is therefore reachable over
-loopback from both `bb_worker` and `bb_runner` on the same host. (Deployments
-that add their own network sandboxing — gVisor, bubblewrap with a net ns — would
-break this assumption and need revisiting.)
+**Transport — Decided: the action's stdio, bridged over a build-directory
+Unix-domain socket.** DAP's native transport is stdin/stdout: a DAP client
+normally launches an adapter as a child and speaks DAP over its stdio. We use
+that same transport remotely. The mechanism rests on a fact about the existing
+code: **`bb_runner` is the sole owner of the action's stdio fds.** It sets
+`cmd.Stdin`/`cmd.Stdout`/`cmd.Stderr` in `pkg/runner/local_runner.go` (today:
+stdin unset → `/dev/null`; stdout/stderr → log files named by path strings the
+worker passes in `RunRequest`). `bb_worker` only hands the runner **path
+strings**; it never sees the live fds. So the byte path necessarily goes through
+the runner, but only minimally:
 
-**Port discovery — Decided: deterministic per-thread port from worker config.**
-`bb_worker` spawns exactly `RunnerConfiguration.Concurrency` execution threads,
-each with a stable `threadID ∈ [0, Concurrency)` (the per-thread executor loop
-in `cmd/bb_worker/main.go`, already surfaced as `workerID["thread"]`), and the
-entire per-thread executor stack is constructed inside that loop. We add a
-`debug_port_range_start` to the runner configuration and assign each thread the
-port `start + threadID`:
+- The worker (per-thread executor, concurrent with `runner.Run`) creates a
+  **Unix-domain socket in the shared build directory** and passes its path to the
+  runner in a new, optional `RunRequest` field — set **only** when the action is
+  debuggable (`BB_DEBUG_SESSION_ID` present). `bb_worker` and `bb_runner` already
+  share the build-directory filesystem and already communicate by passing paths
+  into it, so this fits the existing contract exactly.
+- The runner, when that path is set, **dials** the socket and wires the action's
+  stdio to it: `cmd.Stdin = conn` (the client→server bytes), and
+  `cmd.Stdout = io.MultiWriter(stdoutFile, conn)` — a **tee** so the action's
+  stdout is *both* captured to the normal `ActionResult` log *and* mirrored to the
+  debug channel (server→client bytes). `cmd.Stderr` is **untouched** — it stays a
+  normal log channel (adapters typically write diagnostics there).
+- The worker **accepts** the runner's connection and hands the resulting
+  `net.Conn` to the edge-client (`side = FORWARDER`); the edge-client does all the
+  protocol work, identically to the port-free past — it just bridges this conn
+  instead of a dialed one.
 
-- The range is naturally per-runner (`[start, start + concurrency)`), since
-  `Concurrency` is per-runner.
-- The forwarder for a thread learns its port directly from config + its own
-  `threadID`. The same per-thread executor injects `BB_DEBUG_PORT = start +
-  threadID` into the action's environment (only when the action is debuggable,
-  i.e. `BB_DEBUG_SESSION_ID` is present), so the action's DAP server binds the
-  port the forwarder will dial. Both derive the number from one source.
-- This is a *deterministic* allocation: collision-free across a worker's slots
-  with **no free-port probing** (no TOCTOU race), and it avoids the virtual-FS
-  visibility concerns of a port-file approach entirely.
+Why this is small and clean:
+
+- **No port machinery at all.** No port assignment, no per-thread range, no range
+  coordination across runners/workers, no ephemeral-range avoidance, no
+  `TIME_WAIT`-on-rebind, no `BB_DEBUG_PORT` to compute, inject, or communicate to
+  the adapter's CLI. The action just runs a stdio adapter (the common default,
+  e.g. `lldb-dap` with no extra flags).
+- **Deterministic readiness — no retry-dial.** The worker creates the listener
+  *before* calling `Run`; the runner dials it as part of setting up the action's
+  stdio. The forwarder accepts exactly once. There is no "is the DAP server
+  listening yet?" race (the action's stdout exists from `exec`); a proxy that
+  connects first simply has its messages buffered at the relay (store-and-forward,
+  §5.4) until the forwarder attaches.
+- **Robust under sandboxing.** The action's stdio is delivered as **inherited
+  fds**, which cross `chroot` and network-namespace boundaries unchanged.
+  Deployments that add network sandboxing (gVisor, bubblewrap with a net ns) —
+  which would have broken a loopback-port dial — work here with no special
+  handling. fds cross namespaces; ports do not.
+
+**Forwarder placement — Decided: relay-facing half in `bb_worker`, minimal
+stdio-wiring in `bb_runner`.** The relay-protocol-speaking forwarder (the
+edge-client) lives in `bb_worker`: it already holds outbound gRPC clients to the
+farm (so reaching the relay is just another client) and owns the goroutine around
+the blocking `runner.Run` call (so it can run concurrently and tear down on
+completion). `bb_runner` gains only a tiny, **network-egress-free** step — dialing
+a *local socket file in the build directory* and wiring three fds, exactly the
+kind of local-path work it already does for stdout/stderr. The old objection to
+involving the runner (*"don't give the intentionally-dumb, less-privileged runner
+network egress"*) does **not** apply: the runner never touches the network; the
+relay client stays in the worker. So we get DAP's native stdio transport while
+keeping the forwarder — and all egress — in the worker.
 
 Considerations / operator notes:
-- **Range coordination.** If a host runs multiple runners or multiple
-  `bb_worker` processes, their `[start, start+concurrency)` ranges must not
-  overlap; the worker can validate this at startup.
-- **Avoid the OS ephemeral range** (Linux ~`32768–60999`) so debug ports don't
-  clash with the worker's own outbound sockets.
-- **Port reuse across sequential actions** on a thread may hit `TIME_WAIT` on
-  rebind; mitigate with `SO_REUSEADDR` on the DAP server (a launch-wrapper
-  concern) or tolerate a brief delay.
-- **Readiness still needs retry-dial:** the forwarder retries dialing
-  `127.0.0.1:<port>` until the server is listening, and gives up when the action
-  exits.
-- The one real code change is the per-thread `BB_DEBUG_PORT` env injection in the
-  executor (which already builds the action's env map and is constructed
-  per-thread); it passes through `chroot` fine.
-
-**Forwarder placement — Decided: `bb_worker`.** The forwarder lives in
-`bb_worker`, and `bb_runner` is left untouched. The worker is the only component
-that knows the per-thread port (concurrency and `threadID` are worker concepts),
-it already holds outbound gRPC clients to the farm (so reaching the relay is just
-another client), and it owns the goroutine around the blocking `runner.Run` call
-(so it can run the forwarder concurrently and tear it down on completion). Doing
-this in `bb_runner` would give the intentionally-dumb, less-privileged runner new
-network egress and duplicate knowledge it doesn't have. The runner's only
-advantages — being the action's direct parent and the one that could enter a
-per-action network namespace — are moot today because there is **no netns
-isolation by default** (both dial the same loopback). *Caveat that would reopen
-this:* a deployment adding per-action network sandboxing would force the dialing
-to move into the runner or an in-namespace helper.
+- **stdout must carry pure DAP framing.** Because the action's stdout *is* the
+  server→client DAP channel, the action must **be** the DAP adapter (or the
+  adapter must own stdout and emit the debuggee's program output as DAP `output`
+  events). A stray write to stdout from a wrapper, the shell, or the debuggee
+  would interleave into the frame stream and corrupt it. This is the action's
+  contract (it replaces the old "bind a DAP server on a port" contract). `stderr`
+  is free for diagnostics.
+- **The build log will contain DAP bytes during a debug run.** Because stdout is
+  teed, the `ActionResult` stdout shipped back to Bazel contains the
+  (LSP-framed) server→client DAP traffic. This is expected and benign — ugly but a
+  faithful recording of that half of the session; the developer's real view is the
+  debugger UI, where program output arrives as DAP `output` events.
+- **Tee backpressure.** `io.MultiWriter(stdoutFile, conn)` blocks on its slower
+  sink, so a stalled relay could backpressure the action's stdout. At interactive
+  debug volume this is negligible; if it matters, the runner can buffer the
+  debug-channel write asynchronously (DAP bytes must never be dropped, so the
+  buffer grows or the write blocks — it cannot discard). Left as an operator/impl
+  note, not an MVP blocker.
+- **The real code changes** are: a new optional `RunRequest` field for the
+  socket path; the conditional stdio-wiring block in `local_runner.go`; and the
+  worker-side listener-create / accept / hand-off that replaces the old port
+  logic. The relay, protocol, edge-client, and proxy are unchanged by the choice
+  of transport (see §7).
 
 ### 5.4 Lifecycle and buffering semantics — **Decided (store-and-forward), with open edges**
 
@@ -382,10 +427,10 @@ Model:
 Why this gives disconnect tolerance: the goal is that a brief disconnect that
 resolves quickly does not perturb the local DAP client or the remote DAP server.
 That is achieved by two things together:
-1. **The edges keep their local TCP sockets open across a relay reconnect.** The
-   forwarder's TCP connection to the DAP server's port and the proxy's TCP
-   connection to the DAP client stay up while the gRPC stream to the relay drops
-   and re-establishes. Neither DAP endpoint observes a disconnect — only a pause.
+1. **The edges keep their local connections open across a relay reconnect.** The
+   forwarder's connection to the action's stdio and the proxy's stdio connection
+   to the DAP client stay up while the gRPC stream to the relay drops and
+   re-establishes. Neither DAP endpoint observes a disconnect — only a pause.
 2. **Sequence numbers + replay** ensure the reconnecting side resumes exactly
    where it left off, with no lost or duplicated messages.
 
@@ -393,9 +438,9 @@ That is achieved by two things together:
 uses LSP-style framing — a `Content-Length: <n>\r\n\r\n` header followed by `n`
 bytes of JSON — which is trivial to parse (read the header, read `n` bytes; no
 JSON parsing needed). The proxy and forwarder each read a *complete* DAP message
-off their TCP socket — header included — and hand it to the relay **verbatim** as
-one discrete payload; in the reverse direction they write that payload back onto
-TCP **unchanged** (no re-framing, no reconstruction). The relay therefore deals
+off their local socket — header included — and hand it to the relay **verbatim**
+as one discrete payload; in the reverse direction they write that payload back to
+the local socket **unchanged** (no re-framing, no reconstruction). The relay deals
 only in **discrete opaque payloads** — message-oriented (so a reconnect never
 resumes mid-message) while remaining fully DAP-agnostic, and the original bytes
 are preserved exactly end to end.
@@ -438,13 +483,14 @@ ack**, not by any gRPC transport signal.
   app-visible delivery signal. Neither is safe as a GC trigger.
 - **GC trigger = receiving-edge ack.** Each message carries a per-direction
   `seq`. The receiving edge acks `seq N` once it has written that message to its
-  **local TCP socket** (the DAP client or DAP server — "the right place").
+  **local socket** (the DAP client, or the action's stdio — "the right place").
   Cumulative: "I have through N." The relay then drops everything `≤ N` in that
   direction. Under healthy flow the retained window is a few messages; it grows
   only when a peer is slow or absent.
 - **Resume point comes from the receiver, not the relay's stored ack.** On
   (re)connect the receiving side announces its **high-water mark** (highest
-  contiguous `seq` it has durably written to TCP) as the first message, and the
+  contiguous `seq` it has durably written to its local socket) as the first
+  message, and the
   relay replays from `high_water + 1`. The relay's own stored last-ack must *not*
   drive resume: it can lag the receiver (acks in flight when the stream dropped),
   which would cause needless duplicate replays, and it can never be more current
@@ -468,10 +514,10 @@ ack**, not by any gRPC transport signal.
   the reverse direction's acks, so it keeps reading both streams and relies on the
   per-session **byte cap (below) as the real bound** (see relay-server §6 for the
   full reasoning).
-- **Ack boundary rationale:** "written to local TCP" is the strictest signal
-  available — DAP has no transport-level ack, and if an edge dies after writing,
-  its TCP connection dies too, so the peer DAP endpoint sees a disconnect and the
-  session is finished anyway.
+- **Ack boundary rationale:** "written to the local socket" is the strictest
+  signal available — DAP has no transport-level ack, and if an edge dies after
+  writing, its local connection dies too, so the peer DAP endpoint sees a
+  disconnect and the session is finished anyway.
 - **Other GC levers (kept):** *piggybacked acks* (carry the ack `seq` on data
   flowing the other way — an optimization); *whole-session teardown GC* (drop the
   entire buffer on session end); and a **hard-cap safety valve** — if the unacked
@@ -501,11 +547,12 @@ one rule.
 *The distinction — a dropped gRPC stream is not a teardown.* A stream drop is
 ambiguous (did the edge crash, or is it mid-reconnect?), so it can never by
 itself end a session. The relay distinguishes:
-- **Transient relay-hop disconnect** — the edge's *local* TCP (to the DAP client
-  or DAP server) is still alive and it will reconnect → **retain and await
-  replay**.
-- **Terminal end** — the edge's *local* TCP has closed (the DAP client quit, or
-  the action/DAP server exited) → the DAP session is genuinely over → **reap**.
+- **Transient relay-hop disconnect** — the edge's *local* connection (to the DAP
+  client or the action's stdio) is still alive and it will reconnect → **retain
+  and await replay**.
+- **Terminal end** — the edge's *local* connection has closed (the DAP client
+  quit, or the action/DAP adapter exited) → the DAP session is genuinely over →
+  **reap**.
 
 To make this observable rather than guessed, an edge sends an **explicit
 terminal-close marker** when its local socket closes — distinct from merely
@@ -623,7 +670,7 @@ load-bearing.** The store-and-forward model lets the developer's proxy attach
 the session and waits for the forwarder. The **orphan timeout** (reap a session
 whose second side never connects) does not distinguish "no side present" from
 "one healthy side waiting," so if it fires before the action is scheduled +
-inputs fetched + the DAP server is dialable (minutes under queue backlog), it
+inputs fetched + the DAP adapter is up on stdio (minutes under queue backlog), it
 reaps a perfectly good waiting session. **For the MVP we simply require the
 orphan-timeout default to comfortably exceed worst-case farm scheduling latency.**
 A cleaner later refinement is to only accrue "orphan" time while *no* side is
@@ -677,7 +724,8 @@ add it.
 
 ## 6. Explicit non-goals (first iteration)
 
-- Supporting DAP servers that communicate over stdin/stdout.
+- Supporting DAP adapters that **cannot** speak stdio and only listen on a TCP
+  port (bridgeable out-of-band by a user-supplied stdio↔socket wrapper).
 - Having the relay understand, validate, or transform DAP messages.
 - Multiplexing multiple simultaneous debug sessions per action (revisit later).
 - Debugging actions that have already completed.
@@ -700,9 +748,9 @@ section numbers in parentheses (e.g. "§7.3" = the relay protocol).
   protocol-facing half both edges share: handshake, seq/ack, retain/replay,
   dedupe, reconnect, termination, framing.
 - **§7.4 — worker-side forwarder** ([`forwarder.md`](forwarder.md)).
-  `side = FORWARDER`: reads `BB_DEBUG_SESSION_ID` from the `Command`, injects
-  `BB_DEBUG_PORT`, retry-dials the action, terminates the action on
-  debug-session-end.
-- **§7.5 — local proxy** ([`proxy.md`](proxy.md)). `side = PROXY`: CLI
-  (`--session-id`, `--frontend`, `--listen`), local DAP listener via the
-  frontend, terminate-on-detach, attach-timeout UX.
+  `side = FORWARDER`: reads `BB_DEBUG_SESSION_ID` from the `Command`, has the
+  runner wire the action's stdio to a build-directory socket (teeing stdout to the
+  log), bridges it to the relay, terminates the action on debug-session-end.
+- **§7.5 — local proxy** ([`proxy.md`](proxy.md)). `side = PROXY`: a stdio DAP
+  adapter the DAP client launches; CLI (`--session-id`, `--frontend`), bridges its
+  own stdio to the relay via the frontend, terminate-on-detach, attach-timeout UX.
