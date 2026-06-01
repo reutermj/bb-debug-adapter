@@ -1,0 +1,6 @@
+[submodule "bb-storage"]
+	path = bb-storage
+	url = https://github.com/buildbarn/bb-storage.git
+[submodule "bb-remote-execution"]
+	path = bb-remote-execution
+	url = https://github.com/buildbarn/bb-remote-execution.git
