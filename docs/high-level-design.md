@@ -272,10 +272,17 @@ be blockers (tracked in relay-protocol §10):
   field), which round-trips losslessly — confirm this preserves payloads exactly,
   since the end-to-end "verbatim bytes" guarantee (§5.4) rides on it.
 - **Half-open propagation.** The relay flips to retain-for-replay on a stream
-  error (§5.4); on the proxy leg the proxy's keepalive now terminates at the
-  *frontend*, so confirm a dead proxy↔frontend stream promptly tears down the
-  frontend↔relay backend stream (the forwarder cancels its context on incoming
-  error, which should), and configure keepalive on the frontend↔relay client leg.
+  error (§5.4). For the proxy leg the proxy's keepalive terminates at the
+  *frontend*, so the leg whose death must actually be detected is
+  **proxy↔frontend**, governed by the **frontend's gRPC server-side keepalive
+  enforcement plus the proxy's client keepalive** — not only the frontend↔relay
+  leg. Once the frontend's forwarding stream handler sees the incoming
+  (proxy-side) stream error it cancels the backend stream
+  (`forwarding_stream_handler.go` cancels its derived context on an incoming
+  `RecvMsg` error — confirmed), tearing down frontend↔relay so the relay flips to
+  retain-for-replay. So: configure keepalive on **both** legs — the frontend's
+  server keepalive toward the proxy (to notice the dead proxy promptly) and the
+  frontend↔relay client leg.
 - **Connection-age churn.** If the frontend sets `MaxConnectionAge`, it will
   periodically recycle the proxy's stream; harmless (the protocol resumes via
   `Resume`, §5.4) but means the proxy sees policy-driven reconnects, not just
@@ -452,10 +459,15 @@ ack**, not by any gRPC transport signal.
   until its downstream acks receipt — the "`Send()` is not delivery" gotcha
   applies on every hop, not just at the edges.
 - **What gRPC contributes:** the bidirectional stream *carries* the acks;
-  HTTP/2 flow control *bounds* the unacked window and propagates backpressure to
-  the source TCP (the live DAP endpoint pauses rather than the relay growing
-  unbounded); stream EOF/errors and keepalive PINGs let the relay detect a
-  disconnect and switch from GC to *retain-for-replay*.
+  HTTP/2 flow control provides **best-effort** backpressure on a slow *consumer*
+  (when the relay's own `Send` to that consumer blocks, it naturally stops
+  forwarding that direction); stream EOF/errors and keepalive PINGs let the relay
+  detect a disconnect and switch from GC to *retain-for-replay*. **Flow control is
+  not the authoritative memory bound** — because each edge's data and its acks
+  ride the *same* bidi stream, the relay cannot pause a producer without stalling
+  the reverse direction's acks, so it keeps reading both streams and relies on the
+  per-session **byte cap (below) as the real bound** (see relay-server §6 for the
+  full reasoning).
 - **Ack boundary rationale:** "written to local TCP" is the strictest signal
   available — DAP has no transport-level ack, and if an edge dies after writing,
   its TCP connection dies too, so the peer DAP endpoint sees a disconnect and the
@@ -589,6 +601,35 @@ data flow.
     MVP; proper **attach-style** semantics (detach-and-keep-running, re-attach)
     are punted to a post-MVP feature.
 
+**Action execution timeout vs. human-speed debugging — Punted (MVP).** A
+debuggable action is still subject to the normal REv2 action timeout, which the
+worker enforces around the blocking `Runner.Run` call
+(`executionTimeout := action.Timeout.AsDuration()`, applied via a context
+timeout on the `runner.Run` call in
+`bb-remote-execution/pkg/builder/local_build_executor.go`). Interactive
+debugging — sitting on a breakpoint, stepping — easily exceeds a normal action's
+wall-clock budget, so the worker will cancel the action mid-session when that
+timeout fires. This is **independent of the relay's idle/grace logic** (which
+correctly keeps a healthy paused session alive, see the idle-timeout note above):
+the kill comes from the worker one layer down. **For the MVP we do not solve this
+in the service** — we rely on the developer setting a sufficiently long action
+timeout on the Bazel invocation that starts the debug build. Automatically
+exempting debuggable actions from (or extending) the execution timeout is a
+backward-compatible refinement left for later.
+
+**Orphan-timeout default vs. attach-early — Punted (MVP), but the default is
+load-bearing.** The store-and-forward model lets the developer's proxy attach
+*before* the action exists; the proxy is then the first-touch that materializes
+the session and waits for the forwarder. The **orphan timeout** (reap a session
+whose second side never connects) does not distinguish "no side present" from
+"one healthy side waiting," so if it fires before the action is scheduled +
+inputs fetched + the DAP server is dialable (minutes under queue backlog), it
+reaps a perfectly good waiting session. **For the MVP we simply require the
+orphan-timeout default to comfortably exceed worst-case farm scheduling latency.**
+A cleaner later refinement is to only accrue "orphan" time while *no* side is
+attached (a connected-but-waiting proxy should not age toward an orphan reap);
+backward-compatible, changes a policy not the protocol.
+
 ### 5.5 Triggering debug mode — **Decided**
 An action opts into debugging by carrying the `BB_DEBUG_SESSION_ID` environment
 variable (§5.1); the worker only spins up a forwarder when that variable is
@@ -613,6 +654,19 @@ the frontend's existing transport security. Proper authorization — binding a
 session to the identity that submitted the build, and enforcing it at the relay
 — is explicitly deferred to a later iteration. This is a security gap we are
 accepting only for the MVP.
+
+**The real threat is key *leakage*, not key *guessing*, and the consequence is
+severe.** The UUID is not reliably secret: it travels as a `--action_env`
+variable, which routinely lands in build logs, the Build Event Protocol stream,
+`--execution_log` output, and CI logs. And because the client→server direction
+feeds the remote **DAP server** — which can typically evaluate expressions and
+control execution — anyone who learns the key can take over the session (a new
+`{session_key, side}` stream evicts the incumbent, §6.1) and effectively run code
+on the worker. So "unguessable UUID" understates the exposure: the practical risk
+is a leaked key, and a leaked key is code-execution-grade. We still accept this
+for the MVP, but real authorization (binding the session to the build's submitter
+and enforcing it at the relay) should be treated as the first post-MVP security
+item, not an optional hardening.
 
 One concrete consequence to record: because a new stream for a
 `{session_key, side}` **takes over** from any existing one (the same mechanism

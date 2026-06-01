@@ -462,9 +462,11 @@ protocol.
   to *validate* when we build against it (none expected to block): (a) **payload
   fidelity** — the forwarder round-trips messages through `emptypb.Empty`, so
   confirm `Frame.payload` bytes are preserved exactly; (b) **half-open
-  propagation** — confirm a dead proxy↔frontend stream promptly tears down the
-  frontend↔relay leg so the relay flips to retain-for-replay, and set keepalive on
-  that leg; (c) **connection-age churn** — a frontend `MaxConnectionAge` recycles
+  propagation** — the leg whose death must be detected is **proxy↔frontend**
+  (governed by the frontend's server-side keepalive enforcement + the proxy's
+  client keepalive); the frontend's forwarding handler then cancels the backend
+  stream on the incoming recv error, tearing down the frontend↔relay leg so the
+  relay flips to retain-for-replay. Set keepalive on **both** legs; (c) **connection-age churn** — a frontend `MaxConnectionAge` recycles
   the proxy stream periodically (harmless; resumes via `Resume`).
 - **Defensive handling of a misused `Open`** (§6.3) — whether the relay should
   reject/normalize an `Open` for a `{session_key, side}` that already has delivery
