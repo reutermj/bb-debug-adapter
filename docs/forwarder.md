@@ -152,7 +152,7 @@ engineering guarantees around it now.
   per-thread executor to decide debuggability (§2).
 - **Inject `BB_DEBUG_PORT`** into the action's env map in that same per-thread
   executor (§3) — the only change to the action's environment.
-- **Wrap `Runner.Run`** (around `local_build_executor.go:280`) so the forwarder
+- **Wrap `Runner.Run`** (the `runner.Run` call in `local_build_executor.go`) so the forwarder
   goroutine runs concurrently and is torn down when `Run` returns, and so a
   `PeerClosed` outcome can cancel the run (§5.2).
 - **Construct the relay client** once per worker from config (§7), shared across

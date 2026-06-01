@@ -77,8 +77,8 @@ Key points relevant to this design:
 
 2. **`Runner.Run` is synchronous and blocking.** `bb_worker` calls
    `Runner.Run` (`pkg/proto/runner/runner.proto`) and the call only returns
-   once the action process has exited. See
-   `bb-remote-execution/pkg/builder/local_build_executor.go:280`. There is no
+   once the action process has exited. See the `runner.Run` call in
+   `bb-remote-execution/pkg/builder/local_build_executor.go`. There is no
    existing interactive side channel during execution. Any debug forwarding has
    to happen *concurrently* with an in-flight `Run` call.
 
@@ -117,8 +117,8 @@ We introduce one new component plus two thin adapters at the edges.
 The developer's proxy reaches the relay through the existing `bb_storage`
 frontend, which demuxes the `DebugAdapterRelay` methods and forwards them to a
 separate single-node `bb_dap_relay` backend (§5.2). The worker forwarder is just
-another gRPC client of the same service (it may reach `bb_dap_relay` via the
-frontend or, being an internal farm component, directly).
+another gRPC client of the same service; being an internal farm component, it
+dials `bb_dap_relay` directly rather than through the frontend (§5.2).
 
 ```
  Developer's machine            Build farm
@@ -131,8 +131,8 @@ frontend or, being an internal farm component, directly).
  │                       │ ◀──── │ (demux only) │      │  per-session, two   │
  └──────────────────────┘       └──────────────┘      │  directional logs   │
                                                        └─────────┬──────────┘
-                                       gRPC (via frontend, or    ▲
-                                       direct from the worker)   │
+                                       gRPC (direct from the     ▲
+                                       worker, not via frontend) │
                                       ┌──────────────────────┐   │
                                       │  bb_worker            │───┘
                                       │  port-forwarder (NEW) │
@@ -194,7 +194,8 @@ Why an environment variable and not the other candidates:
   (`platform/trie.go` — only the instance name is prefix-matched, not the
   properties). A per-session-unique value in `Platform` therefore produces a
   brand-new platform string that **no worker advertises**, so the action routes
-  to an empty queue and never schedules (`in_memory_build_queue.go:512,528`).
+  to an empty queue and never schedules (the platform-queue lookup in
+  `in_memory_build_queue.go` fails its longest-prefix match).
   `--remote_default_exec_properties=<unique>` would break execution outright.
 - **Not the action digest.** The worker knows it, but it is content-addressed
   (not unique per session, not secret) and the developer cannot easily single
@@ -277,10 +278,11 @@ break this assumption and need revisiting.)
 
 **Port discovery — Decided: deterministic per-thread port from worker config.**
 `bb_worker` spawns exactly `RunnerConfiguration.Concurrency` execution threads,
-each with a stable `threadID ∈ [0, Concurrency)` (`cmd/bb_worker/main.go:362`,
-already surfaced as `workerID["thread"]`), and the entire per-thread executor
-stack is constructed inside that loop. We add a `debug_port_range_start` to the
-runner configuration and assign each thread the port `start + threadID`:
+each with a stable `threadID ∈ [0, Concurrency)` (the per-thread executor loop
+in `cmd/bb_worker/main.go`, already surfaced as `workerID["thread"]`), and the
+entire per-thread executor stack is constructed inside that loop. We add a
+`debug_port_range_start` to the runner configuration and assign each thread the
+port `start + threadID`:
 
 - The range is naturally per-runner (`[start, start + concurrency)`), since
   `Concurrency` is per-runner.
@@ -597,21 +599,22 @@ add it.
 - Attach-style semantics (detach-and-keep-running, re-attach mid-action): the MVP
   terminates the action when the debugger leaves (§5.4).
 
-## 7. Next steps
+## 7. Related documents
 
-1. Agree on the high-level shape in this document.
-2. ~~Pick a session-identity scheme~~ — decided: env-var session key (§5.1).
-   ~~Confirm the relay reachability model~~ — decided (§5.2): frontend demuxes
-   and forwards to a separate single-node `bb_dap_relay` service.
-3. ~~Define the relay service's gRPC/streaming protocol and proto messages~~ —
-   drafted in [`relay-protocol.md`](relay-protocol.md) (§7.3); refinements closed.
-4. ~~Specify the shared edge-client behavior~~ — drafted in
-   [`edge-client.md`](edge-client.md): the protocol-facing half both edges share
-   (handshake, seq/ack, retain/replay, dedupe, reconnect, termination, framing).
-5. ~~Specify the worker/runner forwarder~~ — drafted in
-   [`forwarder.md`](forwarder.md) (§7.4): `side = FORWARDER`, reads
-   `BB_DEBUG_SESSION_ID` from the `Command`, injects `BB_DEBUG_PORT`, retry-dials
-   the action, terminates the action on debug-session-end.
-6. ~~Specify the local proxy~~ — drafted in [`proxy.md`](proxy.md) (§7.5):
-   `side = PROXY`, CLI (`--session-id`, `--frontend`, `--listen`), local DAP
-   listener via the frontend, terminate-on-detach, attach-timeout UX.
+This document fixes the high-level shape; the follow-up specs below turn each
+decision into a concrete design. They cross-reference each other by the informal
+section numbers in parentheses (e.g. "§7.3" = the relay protocol).
+
+- **§7.3 — relay protocol** ([`relay-protocol.md`](relay-protocol.md)). The
+  gRPC service, proto messages, sequencing/acks, resume-on-reconnect, and
+  termination between an edge and `bb_dap_relay`.
+- **shared edge-client** ([`edge-client.md`](edge-client.md)). The
+  protocol-facing half both edges share: handshake, seq/ack, retain/replay,
+  dedupe, reconnect, termination, framing.
+- **§7.4 — worker-side forwarder** ([`forwarder.md`](forwarder.md)).
+  `side = FORWARDER`: reads `BB_DEBUG_SESSION_ID` from the `Command`, injects
+  `BB_DEBUG_PORT`, retry-dials the action, terminates the action on
+  debug-session-end.
+- **§7.5 — local proxy** ([`proxy.md`](proxy.md)). `side = PROXY`: CLI
+  (`--session-id`, `--frontend`, `--listen`), local DAP listener via the
+  frontend, terminate-on-detach, attach-timeout UX.

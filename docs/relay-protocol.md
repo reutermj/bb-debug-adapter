@@ -62,15 +62,16 @@ Recap of the already-made decisions this grammar is built around:
    └───────────────┘                   └──────────────┘
 ```
 
-- Both edges call the **same `Attach` RPC** on the `bb_storage` frontend's gRPC
-  endpoint. The frontend demuxes `DebugAdapterRelay` by method name (§5.2) and
-  **transparently forwards** the bidirectional stream to the single
-  `bb_dap_relay` node — it does **not** parse stream messages. The protocol is
-  therefore defined **end-to-end between an edge and the relay**; the frontend is
-  a passthrough. This is why §5.4 reasons about "two hops around the relay"
-  (`forwarder → relay`, `relay → proxy`) and treats the frontend as transparent.
-- A deployment **may** let the worker forwarder dial `bb_dap_relay` directly
-  (it is an internal farm component) instead of via the frontend; the proto is
+- Both edges call the **same `Attach` RPC**; only the endpoint they dial
+  differs. The **proxy** dials the `bb_storage` frontend, which demuxes
+  `DebugAdapterRelay` by method name (§5.2) and **transparently forwards** the
+  bidirectional stream to the single `bb_dap_relay` node — it does **not** parse
+  stream messages. The protocol is therefore defined **end-to-end between an edge
+  and the relay**; the frontend is a passthrough. This is why §5.4 reasons about
+  "two hops around the relay" (`forwarder → relay`, `relay → proxy`) and treats
+  the frontend as transparent.
+- The worker forwarder dials `bb_dap_relay` **directly** — it is an internal
+  farm component (§5.2, forwarder §6), not via the frontend; the proto is
   identical either way. The developer proxy always goes via the frontend (the
   single endpoint it already trusts).
 - Transport security and (eventually) auth are inherited from the frontend
